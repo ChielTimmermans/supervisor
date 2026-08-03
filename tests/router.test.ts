@@ -29,4 +29,12 @@ describe('route', () => {
   it('thread reply with no worker goes to supervisor', () => {
     expect(route(post({ rootId: 'tX' }), state(undefined, false))).toEqual({ kind: 'supervisor' });
   });
+  it('thread reply to a finished worker goes to supervisor (not a dead inject)', () => {
+    expect(route(post({ rootId: 't1' }), state(worker({ status: 'finished' }), false)))
+      .toEqual({ kind: 'supervisor' });
+  });
+  it('thread reply to a failed worker goes to supervisor', () => {
+    expect(route(post({ rootId: 't1' }), state(worker({ status: 'failed' }), true)))
+      .toEqual({ kind: 'supervisor' });
+  });
 });

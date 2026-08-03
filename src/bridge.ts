@@ -122,6 +122,12 @@ export class Bridge {
     return out;
   }
 
+  private pushToSupervisor(post: IncomingPost, files: string[]): void {
+    const attach = files.length ? `\nAttached files: ${files.join(', ')}` : '';
+    const kind = post.rootId === '' ? 'New top-level message' : 'Thread message (no active worker)';
+    this.supervisor.push(`${kind} in thread ${post.rootId || post.id} from the operator:\n"${post.message}"${attach}`);
+  }
+
   async handlePost(post: IncomingPost): Promise<void> {
     const files = post.fileIds.length ? await this.downloadAttachments(post) : [];
     if (files.length) log.debug('downloaded attachments', { post: post.id, count: files.length });
@@ -132,9 +138,7 @@ export class Bridge {
 
     if (action.kind === 'supervisor') {
       log.info('route → supervisor', { post: post.id, thread: post.rootId || '(root)', files: files.length, text: preview(post.message) });
-      const attach = files.length ? `\nAttached files: ${files.join(', ')}` : '';
-      const kind = post.rootId === '' ? 'New top-level message' : 'Thread message (no worker)';
-      this.supervisor.push(`${kind} in thread ${post.rootId || post.id} from the operator:\n"${post.message}"${attach}`);
+      this.pushToSupervisor(post, files);
       return;
     }
     if (action.kind === 'resolve_question') {
@@ -144,8 +148,16 @@ export class Bridge {
       return;
     }
     if (action.kind === 'inject_worker') {
-      log.info('route → inject into worker', { worker: action.workerId, thread: post.rootId, files: files.length, text: preview(post.message) });
-      this.workers.get(action.workerId)?.inject(post.message, files);
+      const worker = this.workers.get(action.workerId);
+      if (worker) {
+        log.info('route → inject into worker', { worker: action.workerId, thread: post.rootId, files: files.length, text: preview(post.message) });
+        worker.inject(post.message, files);
+      } else {
+        // DB says this thread's worker is active, but it isn't live in memory
+        // (e.g. a resume that never re-attached). Don't drop the message.
+        log.warn('worker not live in memory; routing to supervisor', { worker: action.workerId, thread: post.rootId });
+        this.pushToSupervisor(post, files);
+      }
     }
   }
 }
