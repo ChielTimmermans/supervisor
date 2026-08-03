@@ -12,7 +12,6 @@ export interface WorkerToolDeps {
   pending: PendingQuestions;
   workerId: string;
   threadRootId: string;
-  onFinish: () => void;
 }
 
 type ToolResult = { content: { type: 'text'; text: string }[] };
@@ -37,11 +36,12 @@ export async function sendUpdateHandler(deps: WorkerToolDeps, args: { text: stri
 }
 
 export async function finishHandler(deps: WorkerToolDeps, args: { summary: string }): Promise<ToolResult> {
-  await deps.gateway.post({ text: args.summary, threadRootId: deps.threadRootId });
-  deps.db.updateWorker(deps.workerId, { status: 'finished' });
-  log.info('worker finished', { worker: deps.workerId });
-  deps.onFinish();
-  return text('Marked finished.');
+  await deps.gateway.post({
+    text: `✅ I believe this feature is complete:\n\n${args.summary}\n\n_Reply with any changes to keep going, or type \`/done\` to close this thread._`,
+    threadRootId: deps.threadRootId,
+  });
+  log.info('worker proposed completion', { worker: deps.workerId });
+  return text('Completion proposed to the operator. Do NOT end the feature yourself — the operator decides. Wait for their reply: they will either request more changes (address them, then call finish again) or close the thread with /done.');
 }
 
 export function createWorkerToolServer(deps: WorkerToolDeps): { server: unknown; toolNames: string[] } {
@@ -55,7 +55,7 @@ export function createWorkerToolServer(deps: WorkerToolDeps): { server: unknown;
       tool('send_update', 'Post a progress update to the operator, optionally attaching files (specs, plans, diffs). Use to share artifacts or status.',
         { text: z.string(), files: z.array(z.string()).optional().describe('Absolute file paths to attach') },
         (a) => sendUpdateHandler(deps, a) as Promise<CallToolResult>),
-      tool('finish', 'Post a final summary and mark this feature complete.',
+      tool('finish', 'Propose that this feature is complete and post a summary for the operator to review. This does NOT end the work — the operator decides. They will either reply with more changes (keep going, call finish again when done) or close the thread themselves with /done.',
         { summary: z.string() },
         (a) => finishHandler(deps, a) as Promise<CallToolResult>),
     ],

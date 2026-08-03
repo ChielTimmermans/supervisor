@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Db } from '../src/db.js';
 import { Bridge } from '../src/bridge.js';
-import { finishHandler } from '../src/tools/workerTools.js';
 import type { Config } from '../src/config.js';
 import type { Gateway } from '../src/mattermost.js';
 import type { IncomingPost } from '../src/types.js';
@@ -87,11 +86,11 @@ describe('Bridge', () => {
     await vi.waitFor(() => expect(sink2.pushed).toContain('here is my answer'));
   });
 
-  it('tears down the worker session when finish runs (prompt stream closes)', async () => {
+  it('operator /done closes the worker and tears down the session (prompt stream closes)', async () => {
     // queryFn that records when its input loop ends (i.e. the prompt stream was closed).
     const streamEnded: string[] = [];
     const queryFn = ((args: any) => (async function* () {
-      yield { type: 'system', session_id: 'sess-finish' };
+      yield { type: 'system', session_id: 'sess-done' };
       for await (const _m of args.prompt) { /* drain */ }
       streamEnded.push('ended');
     })()) as any;
@@ -106,16 +105,13 @@ describe('Bridge', () => {
     const id = res.workerId;
     expect((bridge3 as any).workers.has(id)).toBe(true);
 
-    // Fire the worker's real finish path via its finishHandler through the worker tool onFinish wiring.
-    const worker = (bridge3 as any).workers.get(id);
-    await finishHandler({
-      gateway: fakeGateway(posts3), db: db3, pending: (bridge3 as any).pending,
-      workerId: id, threadRootId: 'root-fin', onFinish: (worker as any).deps.onFinish,
-    }, { summary: 'done' });
+    // Operator types /done in the thread -> the worker is closed.
+    await bridge3.handlePost(post({ id: 'd1', rootId: 'root-fin', message: '/done' }));
 
-    // Removed from the map immediately.
     expect((bridge3 as any).workers.has(id)).toBe(false);
-    // And the deferred stop() actually closed the prompt stream (loop ended).
+    expect(db3.getWorker(id)!.status).toBe('finished');
+    expect(posts3.some((p) => p.threadRootId === 'root-fin' && /closed/i.test(p.text))).toBe(true);
+    // The deferred stop() actually closed the prompt stream (loop ended).
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
   });
 });

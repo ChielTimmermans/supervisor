@@ -43,7 +43,7 @@ describe('end-to-end feature flow', () => {
     expect(spawn.ok).toBe(true);
     const worker = db.getWorkerByThread('root1')!;
     const pending = (bridge as any).pending;
-    const deps = { gateway: (bridge as any).deps.gateway, db, pending, workerId: worker.id, threadRootId: 'root1', onFinish: () => {} };
+    const deps = { gateway: (bridge as any).deps.gateway, db, pending, workerId: worker.id, threadRootId: 'root1' };
 
     // 3. Worker asks a question (blocks).
     const asked = askUserHandler(deps, { question: 'Which file?' });
@@ -55,11 +55,16 @@ describe('end-to-end feature flow', () => {
     await expect(asked).resolves.toMatchObject({ content: [{ text: expect.stringContaining('README.md') }] });
     expect(db.getWorker(worker.id)!.status).toBe('running');
 
-    // 5. Worker sends an artifact, then finishes.
+    // 5. Worker sends an artifact, then PROPOSES completion (does not self-close).
     await sendUpdateHandler(deps, { text: 'Here is the diff', files: ['/scratch/change.diff'] });
     expect(uploads).toContain('/scratch/change.diff');
     await finishHandler(deps, { summary: 'Done: added the note.' });
+    expect(posts.some((p) => p.text.includes('Done: added the note.') && p.text.includes('/done'))).toBe(true);
+    expect(db.getWorker(worker.id)!.status).toBe('running'); // not finished — awaiting the operator
+
+    // 6. Operator closes the thread with /done -> worker torn down, marked finished.
+    await bridge.handlePost(post({ id: 'done1', rootId: 'root1', message: '/done' }));
     expect(db.getWorker(worker.id)!.status).toBe('finished');
-    expect(posts.some((p) => p.text === 'Done: added the note.')).toBe(true);
+    expect(posts.some((p) => /closed/i.test(p.text))).toBe(true);
   });
 });

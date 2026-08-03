@@ -106,6 +106,17 @@ export class Bridge {
     log.info('stopped worker', { worker: id });
   }
 
+  /** Operator explicitly closes a feature (via `/done`): tear down and confirm. */
+  private closeWorker(id: string): void {
+    const rec = this.deps.db.getWorker(id);
+    this.workers.get(id)?.stop();
+    this.workers.delete(id);
+    this.deps.db.updateWorker(id, { status: 'finished' });
+    this.pending.cancel(id);
+    if (rec) void this.deps.gateway.post({ text: 'Closed this feature. 🎉', threadRootId: rec.threadRootId });
+    log.info('closed worker (operator /done)', { worker: id });
+  }
+
   private markFailed(id: string, reason: string): void {
     log.warn('worker failed', { worker: id, reason });
     this.deps.db.updateWorker(id, { status: 'failed' });
@@ -129,6 +140,13 @@ export class Bridge {
   }
 
   async handlePost(post: IncomingPost): Promise<void> {
+    // Operator close command: `/done` (or `/close`) in a thread closes that thread's live worker.
+    const cmd = post.message.trim().toLowerCase();
+    if (post.rootId !== '' && (cmd === '/done' || cmd === '/close')) {
+      const w = this.deps.db.getWorkerByThread(post.rootId);
+      if (w && this.workers.has(w.id)) { this.closeWorker(w.id); return; }
+    }
+
     const files = post.fileIds.length ? await this.downloadAttachments(post) : [];
     if (files.length) log.debug('downloaded attachments', { post: post.id, count: files.length });
     const action = route(post, {

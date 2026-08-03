@@ -28,4 +28,11 @@ export class PendingQuestions {
   hasOpen(workerId: string): boolean {
     return this.resolvers.has(workerId) || this.db.getOpenQuestionForWorker(workerId) !== undefined;
   }
+
+  /** Drop a pending question without delivering an answer (used when a worker is force-closed). */
+  cancel(workerId: string): void {
+    this.resolvers.delete(workerId);
+    const open = this.db.getOpenQuestionForWorker(workerId);
+    if (open) this.db.resolvePendingQuestion(open.id, '(closed)');
+  }
 }

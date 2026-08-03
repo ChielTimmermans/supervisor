@@ -17,14 +17,13 @@ function fakeGateway(): Gateway & { posts: any[]; uploads: string[] } {
   };
 }
 
-let db: Db; let pending: PendingQuestions; let gateway: ReturnType<typeof fakeGateway>; let deps: WorkerToolDeps; let finished: boolean;
+let db: Db; let pending: PendingQuestions; let gateway: ReturnType<typeof fakeGateway>; let deps: WorkerToolDeps;
 beforeEach(() => {
   db = new Db(':memory:');
   db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'a', repoPath: '/a', task: 't' });
   pending = new PendingQuestions(db);
   gateway = fakeGateway();
-  finished = false;
-  deps = { gateway, db, pending, workerId: 'w1', threadRootId: 't1', onFinish: () => { finished = true; } };
+  deps = { gateway, db, pending, workerId: 'w1', threadRootId: 't1' };
 });
 
 describe('worker tools', () => {
@@ -45,10 +44,13 @@ describe('worker tools', () => {
     expect(res.content[0].text).toBeDefined();
   });
 
-  it('finish posts the summary, marks finished, and calls onFinish', async () => {
-    await finishHandler(deps, { summary: 'done' });
-    expect(gateway.posts[0]).toMatchObject({ text: 'done', threadRootId: 't1' });
-    expect(db.getWorker('w1')!.status).toBe('finished');
-    expect(finished).toBe(true);
+  it('finish posts a completion proposal (with /done hint) and does NOT close the worker', async () => {
+    const res = await finishHandler(deps, { summary: 'the feature works now' });
+    expect(gateway.posts[0].threadRootId).toBe('t1');
+    expect(gateway.posts[0].text).toContain('the feature works now');
+    expect(gateway.posts[0].text).toContain('/done');
+    // finish no longer marks the worker finished — completion is the operator's call.
+    expect(db.getWorker('w1')!.status).toBe('running');
+    expect(res.content[0].text).toBeDefined();
   });
 });

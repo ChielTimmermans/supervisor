@@ -11,8 +11,9 @@ export const WORKER_SYSTEM_PROMPT = `You are an autonomous engineering worker as
 The human operator is NOT watching your terminal. The ONLY way to communicate with them is via your tools:
 - ask_user: ask a question and wait for the reply (use whenever you need a decision, clarification, or input).
 - send_update: post progress or share an artifact (spec, plan, diff) as an attachment.
-- finish: post a final summary when the feature is complete.
-Work autonomously. Decide for yourself when you need the operator. When done, call finish.`;
+- finish: PROPOSE that the feature is complete and post a summary. This does NOT end the work.
+Work autonomously. Decide for yourself when you need the operator.
+Completion is the operator's call, not yours. When you believe the feature is done, call finish to propose it, then stop and wait. The operator will either reply with more changes (address them and call finish again) or close the thread with /done. Never treat yourself as finished until the operator closes the thread.`;
 
 export interface WorkerDeps {
   queryFn: QueryFn;
@@ -34,7 +35,6 @@ export class Worker {
     const { server, toolNames } = createWorkerToolServer({
       gateway: this.deps.gateway, db: this.deps.db, pending: this.deps.pending,
       workerId: this.deps.record.id, threadRootId: this.deps.record.threadRootId,
-      onFinish: this.deps.onFinish,
     });
     return new ClaudeSession(
       this.deps.queryFn,
