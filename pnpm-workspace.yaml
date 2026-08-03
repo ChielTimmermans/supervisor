@@ -1,0 +1,4 @@
+# pnpm 11 blocks dependency build scripts by default. Allow them so the native
+# better-sqlite3 module (and esbuild) compile — the same behavior npm has by
+# default. This is a first-party, trusted project.
+dangerouslyAllowAllBuilds: true
