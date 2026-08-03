@@ -1,6 +1,7 @@
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { log, preview } from '../log.js';
 import type { Gateway } from '../mattermost.js';
 import type { Db } from '../db.js';
 import type { PendingQuestions } from '../pending.js';
@@ -20,8 +21,10 @@ const text = (t: string): ToolResult => ({ content: [{ type: 'text', text: t }] 
 export async function askUserHandler(deps: WorkerToolDeps, args: { question: string }): Promise<ToolResult> {
   const postId = await deps.gateway.post({ text: args.question, threadRootId: deps.threadRootId });
   deps.db.updateWorker(deps.workerId, { status: 'waiting' });
+  log.info('worker asks — waiting for reply', { worker: deps.workerId, q: preview(args.question) });
   const answer = await deps.pending.ask({ workerId: deps.workerId, questionPostId: postId });
   deps.db.updateWorker(deps.workerId, { status: 'running' });
+  log.info('worker got reply — resuming', { worker: deps.workerId });
   return text(`The operator replied: ${answer}`);
 }
 
@@ -29,12 +32,14 @@ export async function sendUpdateHandler(deps: WorkerToolDeps, args: { text: stri
   const fileIds: string[] = [];
   for (const f of args.files ?? []) fileIds.push(await deps.gateway.uploadFile(f));
   await deps.gateway.post({ text: args.text, threadRootId: deps.threadRootId, fileIds: fileIds.length ? fileIds : undefined });
+  log.info('worker update', { worker: deps.workerId, files: fileIds.length, text: preview(args.text) });
   return text('Update posted to the operator.');
 }
 
 export async function finishHandler(deps: WorkerToolDeps, args: { summary: string }): Promise<ToolResult> {
   await deps.gateway.post({ text: args.summary, threadRootId: deps.threadRootId });
   deps.db.updateWorker(deps.workerId, { status: 'finished' });
+  log.info('worker finished', { worker: deps.workerId });
   deps.onFinish();
   return text('Marked finished.');
 }

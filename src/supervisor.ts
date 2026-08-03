@@ -1,4 +1,5 @@
 import { ClaudeSession, type QueryFn } from './session.js';
+import { log } from './log.js';
 import type { Db } from './db.js';
 import type { Config } from './config.js';
 
@@ -34,8 +35,8 @@ export class Supervisor {
         disallowedTools: ['Bash', 'Write', 'Edit'],
         resume: deps.db.getMeta('supervisor_session') ?? undefined,
       },
-      (id) => deps.db.setMeta('supervisor_session', id),
-      (err) => console.error('Supervisor session error:', err),
+      (id) => { log.debug('supervisor session id', { session: id }); deps.db.setMeta('supervisor_session', id); },
+      (err) => log.error('supervisor session error', { err: err instanceof Error ? err.message : String(err) }),
     );
   }
   start(seed: string): void { this.session.start(seed); }

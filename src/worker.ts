@@ -1,5 +1,6 @@
 import { ClaudeSession, type QueryFn } from './session.js';
 import { createWorkerToolServer } from './tools/workerTools.js';
+import { log } from './log.js';
 import { PendingQuestions } from './pending.js';
 import type { Gateway } from './mattermost.js';
 import type { Db } from './db.js';
@@ -46,8 +47,9 @@ export class Worker {
         env: { ...process.env as Record<string, string>, MCP_TIMEOUT: String(this.deps.cfg.askUserTimeoutMs) },
         resume,
       },
-      (id) => this.deps.db.updateWorker(this.deps.record.id, { sessionId: id }),
+      (id) => { log.debug('worker session id', { worker: this.deps.record.id, session: id }); this.deps.db.updateWorker(this.deps.record.id, { sessionId: id }); },
       (err) => {
+        log.error('worker session error', { worker: this.deps.record.id, err: err instanceof Error ? err.message : String(err) });
         this.deps.db.updateWorker(this.deps.record.id, { status: 'failed' });
         void this.deps.gateway.post({ text: `Worker hit a fatal session error: ${err instanceof Error ? err.message : String(err)}`, threadRootId: this.deps.record.threadRootId });
         this.deps.onFinish();

@@ -3,6 +3,7 @@ import type { Post } from '@mattermost/types/posts';
 import WebSocket from 'ws';
 import { readFile, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
+import { log, preview } from './log.js';
 import type { IncomingPost } from './types.js';
 import type { Config } from './config.js';
 
@@ -46,11 +47,16 @@ export class MattermostGateway implements Gateway {
   async connect(onPost: (p: IncomingPost) => void): Promise<void> {
     const me = await this.client.getMe();
     this.botId = me.id;
+    log.info('mattermost connected', { bot: `${me.username}(${me.id})`, channel: this.cfg.channelId });
 
     const ws = new WebSocketClient({
       newWebSocketFn: (url: string) => new WebSocket(url) as unknown as globalThis.WebSocket,
     });
     this.ws = ws;
+    ws.addFirstConnectListener(() => log.info('websocket connected'));
+    ws.addReconnectListener(() => log.warn('websocket reconnected'));
+    ws.addCloseListener((code: number) => log.warn('websocket closed', { code }));
+    ws.addErrorListener((err: unknown) => log.error('websocket error', { err: err instanceof Error ? err.message : String(err) }));
     ws.addMessageListener((msg) => {
       if (msg.event !== 'posted') return;
       if (msg.broadcast.channel_id !== this.cfg.channelId) return;
@@ -58,6 +64,7 @@ export class MattermostGateway implements Gateway {
       const raw = JSON.parse(data.post) as Post;
       const p = normalizeIncomingPost(raw, this.botId);
       if (p.isOwn) return;
+      log.info('◀ post received', { id: p.id, thread: p.rootId || '(root)', user: p.userId, files: p.fileIds.length, text: preview(p.message) });
       onPost(p);
     });
     const wsUrl = this.cfg.url.replace(/^http/, 'ws') + '/api/v4/websocket';
@@ -65,6 +72,7 @@ export class MattermostGateway implements Gateway {
   }
 
   async post(args: { text: string; threadRootId?: string; fileIds?: string[] }): Promise<string> {
+    log.debug('▶ post', { thread: args.threadRootId || '(root)', files: args.fileIds?.length ?? 0, text: preview(args.text) });
     const created = await this.client.createPost({
       channel_id: this.cfg.channelId,
       message: args.text,

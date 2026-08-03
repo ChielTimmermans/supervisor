@@ -6,6 +6,7 @@ import { PendingQuestions } from './pending.js';
 import { Worker } from './worker.js';
 import { Supervisor } from './supervisor.js';
 import { createSupervisorToolServer, type SupervisorToolDeps } from './tools/supervisorTools.js';
+import { log, preview } from './log.js';
 import type { QueryFn } from './session.js';
 import type { Gateway } from './mattermost.js';
 import type { Db } from './db.js';
@@ -27,6 +28,8 @@ export class Bridge {
     await this.deps.gateway.connect((p) => { void this.handlePost(p); });
 
     // Reconcile persisted workers.
+    const resumable = this.deps.db.listWorkers().filter((w) => w.status === 'running' || w.status === 'waiting');
+    if (resumable.length) log.info('reconciling workers', { count: resumable.length });
     for (const rec of this.deps.db.listWorkers()) {
       if (rec.status === 'finished' || rec.status === 'failed') continue;
       if (!rec.sessionId) { this.markFailed(rec.id, 'No session to resume.'); continue; }
@@ -42,9 +45,11 @@ export class Bridge {
       try {
         worker.startResumed();
         this.workers.set(rec.id, worker);
+        log.info('resumed worker', { worker: rec.id, repo: rec.repoName, thread: rec.threadRootId });
         const openQ = this.deps.db.getOpenQuestionForWorker(rec.id);
         if (openQ) {
           this.deps.db.resolvePendingQuestion(openQ.id, '(cleared on restart)');
+          log.info('cleared stale question on restart', { worker: rec.id });
           void this.deps.gateway.post({
             text: 'I was restarted and lost the question I had open. Please re-send your answer — I will use it, or re-ask if I still need input.',
             threadRootId: rec.threadRootId,
@@ -59,6 +64,7 @@ export class Bridge {
     this.supervisor = new Supervisor({ queryFn: this.deps.queryFn, db: this.deps.db, cfg: this.deps.cfg, toolServer });
     const active = this.deps.db.listWorkers().filter((w) => w.status === 'running' || w.status === 'waiting');
     this.supervisor.start(`You are online. Active workers: ${active.length ? active.map((w) => `${w.id}(${w.repoName})`).join(', ') : 'none'}.`);
+    log.info('supervisor session started', { activeWorkers: active.length });
   }
 
   private supervisorDeps(): SupervisorToolDeps {
@@ -71,9 +77,9 @@ export class Bridge {
 
   private spawnWorker(args: { repo: string; task: string; threadRootId: string }): { ok: true; workerId: string } | { ok: false; reason: string } {
     const repo = this.deps.cfg.repos[args.repo];
-    if (!repo) return { ok: false, reason: `Unknown repo ${args.repo}` };
+    if (!repo) { log.warn('spawn rejected: unknown repo', { repo: args.repo }); return { ok: false, reason: `Unknown repo ${args.repo}` }; }
     const active = this.workers.size;
-    if (active >= this.deps.cfg.workerConcurrency) return { ok: false, reason: 'Concurrency limit reached' };
+    if (active >= this.deps.cfg.workerConcurrency) { log.warn('spawn rejected: at capacity', { active, cap: this.deps.cfg.workerConcurrency }); return { ok: false, reason: 'Concurrency limit reached' }; }
 
     const id = 'w-' + randomUUID().slice(0, 8);
     const rec = this.deps.db.createWorker({ id, threadRootId: args.threadRootId, repoName: args.repo, repoPath: repo.path, task: args.task });
@@ -88,6 +94,7 @@ export class Bridge {
     });
     worker.start();
     this.workers.set(id, worker);
+    log.info('spawned worker', { worker: id, repo: args.repo, thread: args.threadRootId, task: preview(args.task, 80) });
     void this.deps.gateway.post({ text: `Started a worker in **${args.repo}** for this feature.`, threadRootId: args.threadRootId });
     return { ok: true, workerId: id };
   }
@@ -96,9 +103,11 @@ export class Bridge {
     this.workers.get(id)?.stop();
     this.workers.delete(id);
     this.deps.db.updateWorker(id, { status: 'finished' });
+    log.info('stopped worker', { worker: id });
   }
 
   private markFailed(id: string, reason: string): void {
+    log.warn('worker failed', { worker: id, reason });
     this.deps.db.updateWorker(id, { status: 'failed' });
     const rec = this.deps.db.getWorker(id);
     if (rec) void this.deps.gateway.post({ text: `Worker could not be restored: ${reason}`, threadRootId: rec.threadRootId });
@@ -115,23 +124,27 @@ export class Bridge {
 
   async handlePost(post: IncomingPost): Promise<void> {
     const files = post.fileIds.length ? await this.downloadAttachments(post) : [];
+    if (files.length) log.debug('downloaded attachments', { post: post.id, count: files.length });
     const action = route(post, {
       getWorkerByThread: (t) => this.deps.db.getWorkerByThread(t),
       hasOpenQuestion: (wid) => this.pending.hasOpen(wid),
     });
 
     if (action.kind === 'supervisor') {
+      log.info('route → supervisor', { post: post.id, thread: post.rootId || '(root)', files: files.length, text: preview(post.message) });
       const attach = files.length ? `\nAttached files: ${files.join(', ')}` : '';
       const kind = post.rootId === '' ? 'New top-level message' : 'Thread message (no worker)';
       this.supervisor.push(`${kind} in thread ${post.rootId || post.id} from the operator:\n"${post.message}"${attach}`);
       return;
     }
     if (action.kind === 'resolve_question') {
+      log.info('route → resolve question', { worker: action.workerId, thread: post.rootId, files: files.length });
       const answer = files.length ? `${post.message}\nAttached files:\n${files.join('\n')}` : post.message;
       this.pending.resolve(action.workerId, answer);
       return;
     }
     if (action.kind === 'inject_worker') {
+      log.info('route → inject into worker', { worker: action.workerId, thread: post.rootId, files: files.length, text: preview(post.message) });
       this.workers.get(action.workerId)?.inject(post.message, files);
     }
   }
