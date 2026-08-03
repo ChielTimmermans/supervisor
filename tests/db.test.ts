@@ -32,4 +32,24 @@ describe('Db', () => {
     db.setMeta('supervisor_session', 's-123');
     expect(db.getMeta('supervisor_session')).toBe('s-123');
   });
+
+  it('creates and de-dups incidents by fingerprint', () => {
+    const inc = db.createIncident({
+      id: 'i1', fingerprint: 'KubeProxyDown', source: 'prometheus', service: null,
+      repoName: null, threadRootId: 't-inc', workerId: 'w1', summary: 'proxy down',
+    });
+    expect(inc.status).toBe('open');
+    expect(inc.refireCount).toBe(1);
+    expect(db.getOpenIncidentByFingerprint('KubeProxyDown')?.id).toBe('i1');
+    expect(db.getIncidentByThread('t-inc')?.id).toBe('i1');
+
+    db.recordRefire('i1');
+    expect(db.getIncident('i1')!.refireCount).toBe(2);
+
+    expect(db.listOpenIncidents().map((x) => x.id)).toEqual(['i1']);
+
+    db.setIncidentStatus('i1', 'closed');
+    expect(db.getOpenIncidentByFingerprint('KubeProxyDown')).toBeUndefined();
+    expect(db.listOpenIncidents()).toEqual([]);
+  });
 });

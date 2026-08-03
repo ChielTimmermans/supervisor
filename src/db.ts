@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import type { WorkerRecord, WorkerStatus } from './types.js';
+import type { WorkerRecord, WorkerStatus, IncidentRecord, IncidentStatus, AlertSource } from './types.js';
 
 export class Db {
   private db: Database.Database;
@@ -29,6 +29,22 @@ export class Db {
       );
       CREATE INDEX IF NOT EXISTS idx_pq_worker ON pending_questions(worker_id, resolved);
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS incidents (
+        id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        source TEXT NOT NULL,
+        service TEXT,
+        repo_name TEXT,
+        thread_root_id TEXT NOT NULL,
+        worker_id TEXT,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        refire_count INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS idx_incidents_fp ON incidents(fingerprint, status);
+      CREATE INDEX IF NOT EXISTS idx_incidents_thread ON incidents(thread_root_id);
     `);
   }
 
@@ -96,6 +112,60 @@ export class Db {
   getMeta(key: string): string | undefined {
     const r = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as any;
     return r?.value;
+  }
+
+  // --- incidents ---
+
+  private incidentRow(r: any): IncidentRecord {
+    return {
+      id: r.id, fingerprint: r.fingerprint, source: r.source as AlertSource,
+      service: r.service, repoName: r.repo_name, threadRootId: r.thread_root_id,
+      workerId: r.worker_id, status: r.status as IncidentStatus, summary: r.summary,
+      createdAt: r.created_at, lastSeenAt: r.last_seen_at, refireCount: r.refire_count,
+    };
+  }
+
+  createIncident(i: {
+    id: string; fingerprint: string; source: AlertSource; service: string | null;
+    repoName: string | null; threadRootId: string; workerId: string | null; summary: string;
+  }): IncidentRecord {
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO incidents (id, fingerprint, source, service, repo_name, thread_root_id, worker_id, status, summary, created_at, last_seen_at, refire_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 1)`
+    ).run(i.id, i.fingerprint, i.source, i.service, i.repoName, i.threadRootId, i.workerId, i.summary, now, now);
+    return this.getIncident(i.id)!;
+  }
+
+  getIncident(id: string): IncidentRecord | undefined {
+    const r = this.db.prepare(`SELECT * FROM incidents WHERE id = ?`).get(id);
+    return r ? this.incidentRow(r) : undefined;
+  }
+
+  getOpenIncidentByFingerprint(fingerprint: string): IncidentRecord | undefined {
+    const r = this.db.prepare(
+      `SELECT * FROM incidents WHERE fingerprint = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1`
+    ).get(fingerprint);
+    return r ? this.incidentRow(r) : undefined;
+  }
+
+  getIncidentByThread(threadRootId: string): IncidentRecord | undefined {
+    const r = this.db.prepare(
+      `SELECT * FROM incidents WHERE thread_root_id = ? ORDER BY created_at DESC LIMIT 1`
+    ).get(threadRootId);
+    return r ? this.incidentRow(r) : undefined;
+  }
+
+  listOpenIncidents(): IncidentRecord[] {
+    return this.db.prepare(`SELECT * FROM incidents WHERE status != 'closed' ORDER BY created_at`).all().map((r) => this.incidentRow(r));
+  }
+
+  recordRefire(id: string): void {
+    this.db.prepare(`UPDATE incidents SET last_seen_at = ?, refire_count = refire_count + 1 WHERE id = ?`).run(Date.now(), id);
+  }
+
+  setIncidentStatus(id: string, status: IncidentStatus): void {
+    this.db.prepare(`UPDATE incidents SET status = ?, last_seen_at = ? WHERE id = ?`).run(status, Date.now(), id);
   }
 
   close(): void { this.db.close(); }
