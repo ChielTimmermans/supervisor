@@ -92,13 +92,42 @@ enforces safety regardless of what the model types.
 `created_at`, `last_seen_at`, `refire_count`. When the operator `/done`s an
 investigation thread, the linked incident is set `closed`.
 
-### Parsing (source-specific, best-effort — needs real samples)
+### Parsing (source-specific; formats confirmed from real samples)
 
-- **GlitchTip:** fingerprint = issue id / issue URL; fields from the notification body.
-- **Prometheus/Alertmanager:** fingerprint = `alertname` + sorted key labels;
-  `status` from firing/resolved; **fallback** = a normalized hash of the message body.
-- The parser is tuned to the actual webhook message format. **A sample message
-  from each ingest channel is required to write reliable extraction.**
+Parsers prefer an explicit stable id if the webhook template provides one
+(Alertmanager `{{ .Fingerprint }}`, GlitchTip issue URL), else fall back to the
+heuristic below.
+
+**Prometheus/Alertmanager** (rendered Mattermost template), e.g.:
+```
+:red_circle: [FIRING] KubeProxyDown
+Target disappeared from Prometheus target discovery.
+KubeProxy has disappeared from Prometheus target discovery.
+📊 Open Grafana (Infrastructure)
+```
+- `status`: `[FIRING]` → firing, `[RESOLVED]` → resolved (cross-check the emoji
+  `:red_circle:` / `:large_green_circle:`).
+- alert name: the token after `[FIRING]`/`[RESOLVED]` (`KubeProxyDown`).
+- `severity`: from the emoji.
+- `summary`: the description line(s) following the header.
+- `fingerprint`: the alert name (the template groups by alertname; no per-instance
+  labels are rendered). Include sorted labels if a deployment renders them.
+
+**GlitchTip** (Mattermost notification), e.g.:
+```
+GlitchTip Alert
+TypeError: Failed to fetch dynamically imported module: https://console…/chunk-V4J…
+Project        Environment
+console-frontend   development
+```
+- error title: the line after the `GlitchTip Alert` header.
+- `service` = Project (`console-frontend`); environment recorded (`development`).
+- `summary`: the error title.
+- `fingerprint`: `hash(project + environment + normalize(errorTitle))`, where
+  `normalize` strips volatile tokens — URLs, chunk hashes (`chunk-V4J…`), and long
+  hex/number runs — so redeploys don't spawn a fresh incident every time.
+
+`alerts-business` ("nothing yet") is left unconfigured until it has a format.
 
 ### Interaction with existing pieces
 
@@ -119,10 +148,17 @@ investigation thread, the linked incident is set `closed`.
   documented access behind read-only RBAC; add auditable tool wrappers later if
   wanted.
 
+## Unmapped-repo alerts (resolved)
+
+An alert whose service isn't in the repo map (e.g. the infra alert `KubeProxyDown`)
+still spawns a **read-only diagnosis worker** — but with **no repo cwd** (a scratch
+working directory), cluster/monitoring access only. It investigates and reports;
+if a code fix is warranted it names where it belongs and the supervisor asks the
+operator which repo to continue in. Default is **diagnose-anyway**, not wait.
+
 ## Open items
 
-- **Sample alert messages** from each source (to write the parsers).
 - Cooldown default and whether `resolved_upstream` should also nudge the operator
   to close the thread.
-- Whether unmapped-repo alerts should still spawn a read-only diagnosis worker
-  (no repo, cluster/monitoring only) or strictly wait for the operator's repo choice.
+- Optional: switch parsers to explicit webhook ids (`{{ .Fingerprint }}` /
+  GlitchTip issue URL) if the templates can include them.
