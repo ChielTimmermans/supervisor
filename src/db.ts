@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import type { WorkerRecord, WorkerStatus, IncidentRecord, IncidentStatus, AlertSource } from './types.js';
+import type { WorkerRecord, WorkerStatus, WorkerKind, IncidentRecord, IncidentStatus, AlertSource } from './types.js';
 
 export class Db {
   private db: Database.Database;
@@ -14,6 +14,7 @@ export class Db {
         repo_path TEXT NOT NULL,
         session_id TEXT,
         status TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'feature',
         task TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -46,22 +47,27 @@ export class Db {
       CREATE INDEX IF NOT EXISTS idx_incidents_fp ON incidents(fingerprint, status);
       CREATE INDEX IF NOT EXISTS idx_incidents_thread ON incidents(thread_root_id);
     `);
+    // Migration: add workers.kind to databases created before it existed.
+    const cols = this.db.prepare(`PRAGMA table_info(workers)`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === 'kind')) {
+      this.db.exec(`ALTER TABLE workers ADD COLUMN kind TEXT NOT NULL DEFAULT 'feature'`);
+    }
   }
 
   private row(r: any): WorkerRecord {
     return {
       id: r.id, threadRootId: r.thread_root_id, repoName: r.repo_name, repoPath: r.repo_path,
-      sessionId: r.session_id, status: r.status as WorkerStatus, task: r.task,
-      createdAt: r.created_at, updatedAt: r.updated_at,
+      sessionId: r.session_id, status: r.status as WorkerStatus, kind: (r.kind ?? 'feature') as WorkerKind,
+      task: r.task, createdAt: r.created_at, updatedAt: r.updated_at,
     };
   }
 
-  createWorker(w: { id: string; threadRootId: string; repoName: string; repoPath: string; task: string }): WorkerRecord {
+  createWorker(w: { id: string; threadRootId: string; repoName: string; repoPath: string; task: string; kind?: WorkerKind }): WorkerRecord {
     const now = Date.now();
     this.db.prepare(
-      `INSERT INTO workers (id, thread_root_id, repo_name, repo_path, session_id, status, task, created_at, updated_at)
-       VALUES (?, ?, ?, ?, NULL, 'running', ?, ?, ?)`
-    ).run(w.id, w.threadRootId, w.repoName, w.repoPath, w.task, now, now);
+      `INSERT INTO workers (id, thread_root_id, repo_name, repo_path, session_id, status, kind, task, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NULL, 'running', ?, ?, ?, ?)`
+    ).run(w.id, w.threadRootId, w.repoName, w.repoPath, w.kind ?? 'feature', w.task, now, now);
     return this.getWorker(w.id)!;
   }
 

@@ -33,6 +33,7 @@ describe('parsePrometheus', () => {
     expect(e.status).toBe('firing');
     expect(e.fingerprint).toBe('prometheus:KubeProxyDown');
     expect(e.severity).toBe('critical');
+    expect(e.summary).toContain('KubeProxyDown');
     expect(e.summary).toContain('disappeared');
     expect(e.summary).not.toContain('Open Grafana');
   });

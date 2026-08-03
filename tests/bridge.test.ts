@@ -115,4 +115,58 @@ describe('Bridge', () => {
     // The deferred stop() actually closed the prompt stream (loop ended).
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
   });
+
+  function ingestBridge(posts: any[], sink: { pushed: string[] }, db: Db) {
+    const c = { ...cfg, ingestChannels: [{ channelId: 'c-infra', source: 'prometheus' as const }] } as Config;
+    return new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db, cfg: c });
+  }
+  const fire = (msg: string) => post({ channelId: 'c-infra', rootId: '', message: msg });
+
+  it('an ingest-channel alert opens an investigation and records an incident', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridge(p, s, d); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] KubeProxyDown\nTarget disappeared from discovery.'));
+
+    const inc = d.getOpenIncidentByFingerprint('prometheus:KubeProxyDown');
+    expect(inc).toBeTruthy();
+    expect(inc!.workerId).toBeTruthy();
+    // opening message posted to the main channel (no thread root)
+    expect(p.some((x) => /Investigating/i.test(x.text) && !x.threadRootId)).toBe(true);
+    // the investigation worker got the alert as its task
+    await vi.waitFor(() => expect(s.pushed.some((m) => m.includes('KubeProxyDown'))).toBe(true));
+    expect(d.listWorkers()[0].kind).toBe('investigation');
+  });
+
+  it('a re-fire of the same alert does not open a second investigation', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridge(p, s, d); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] KubeProxyDown\nx'));
+    await b.handlePost(fire(':red_circle: [FIRING] KubeProxyDown\nx'));
+
+    expect(d.getOpenIncidentByFingerprint('prometheus:KubeProxyDown')!.refireCount).toBe(2);
+    expect(d.listWorkers().filter((w) => w.kind === 'investigation').length).toBe(1);
+    expect(p.some((x) => /fired again/i.test(x.text))).toBe(true);
+  });
+
+  it('a resolved alert marks the incident resolved_upstream', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridge(p, s, d); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] DiskFull\nx'));
+    await b.handlePost(fire(':large_green_circle: [RESOLVED] DiskFull\nx'));
+
+    expect(d.getOpenIncidentByFingerprint('prometheus:DiskFull')!.status).toBe('resolved_upstream');
+    expect(p.some((x) => /resolved upstream/i.test(x.text))).toBe(true);
+  });
+
+  it('/done on an investigation thread closes both the worker and the incident', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridge(p, s, d); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] OOMKilled\nx'));
+    const inc = d.getOpenIncidentByFingerprint('prometheus:OOMKilled')!;
+
+    // Operator closes in the main channel thread (not an ingest channel).
+    await b.handlePost(post({ id: 'done', channelId: 'c', rootId: inc.threadRootId, message: '/done' }));
+    expect(d.getIncident(inc.id)!.status).toBe('closed');
+    expect(d.getWorker(inc.workerId!)!.status).toBe('finished');
+  });
 });

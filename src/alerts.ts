@@ -32,11 +32,12 @@ export function parsePrometheus(message: string): AlertEvent | null {
 
   const lines = message.split(/\r?\n/).map((l) => l.trim());
   const headerIdx = lines.findIndex((l) => /\[(FIRING|RESOLVED)/i.test(l));
-  const summary = lines
+  const desc = lines
     .slice(headerIdx + 1)
     .filter((l) => l && !/open grafana|open dashboard/i.test(l) && !/^https?:\/\//.test(l) && !/^[📊📈🔗]/.test(l))
     .join(' ')
-    .trim() || alertName;
+    .trim();
+  const summary = desc ? `${alertName}: ${desc}` : alertName;
 
   const emoji = Object.keys(SEVERITY_BY_EMOJI).find((e) => message.includes(e));
   return {

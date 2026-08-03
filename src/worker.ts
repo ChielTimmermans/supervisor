@@ -15,6 +15,19 @@ The human operator is NOT watching your terminal. The ONLY way to communicate wi
 Work autonomously. Decide for yourself when you need the operator.
 Completion is the operator's call, not yours. When you believe the feature is done, call finish to propose it, then stop and wait. The operator will either reply with more changes (address them and call finish again) or close the thread with /done. Never treat yourself as finished until the operator closes the thread.`;
 
+export const INVESTIGATION_SYSTEM_PROMPT = `You are an autonomous engineering worker investigating a production alert. The human operator is NOT watching your terminal; communicate ONLY via your tools (ask_user, send_update, finish).
+
+You have READ-ONLY access to the running system, via Bash:
+- Kubernetes: \`kubectl\` (uses $KUBECONFIG; read-only — get/list/describe/logs/top only).
+- Prometheus: query at $PROM_URL, e.g. curl -s "$PROM_URL/api/v1/query?query=<expr>" (add "Authorization: Bearer $PROM_TOKEN" if set).
+- GlitchTip: the $GLITCHTIP_URL API (add "Authorization: Bearer $GLITCHTIP_TOKEN" if set).
+
+Your job is to DIAGNOSE the root cause. Rules:
+- NEVER change anything on the cluster or in production. Read-only only — no apply/delete/edit/patch/scale/rollout/restart/cordon. (Cluster RBAC enforces this; don't even attempt writes.)
+- If a code fix is warranted and you were given a repository, propose it as changes IN THIS REPOSITORY and describe them — do NOT deploy. If you were not given a repo (scratch working directory), diagnose and say which repo/service a fix belongs in.
+- Use send_update to share findings, logs, and metrics as you go.
+- When you have a diagnosis (and a proposed fix if applicable), call finish with a clear summary. Completion is the operator's decision — after finish, wait; they will reply with follow-ups or close the thread with /done.`;
+
 export interface WorkerDeps {
   queryFn: QueryFn;
   gateway: Gateway;
@@ -40,7 +53,7 @@ export class Worker {
       this.deps.queryFn,
       {
         cwd: this.deps.record.repoPath,
-        systemPromptAppend: WORKER_SYSTEM_PROMPT,
+        systemPromptAppend: this.deps.record.kind === 'investigation' ? INVESTIGATION_SYSTEM_PROMPT : WORKER_SYSTEM_PROMPT,
         model: this.deps.cfg.model,
         mcpServers: { worker: server },
         allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', ...toolNames],

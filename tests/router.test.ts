@@ -7,7 +7,7 @@ const post = (over: Partial<IncomingPost>): IncomingPost => ({
 });
 const worker = (over: Partial<WorkerRecord>): WorkerRecord => ({
   id: 'w1', threadRootId: 't1', repoName: 'a', repoPath: '/a', sessionId: 's', status: 'running',
-  task: 't', createdAt: 0, updatedAt: 0, ...over,
+  kind: 'feature', task: 't', createdAt: 0, updatedAt: 0, ...over,
 });
 
 function state(worker: WorkerRecord | undefined, openQ: boolean): RouterState {

@@ -1,5 +1,7 @@
 export type WorkerStatus = 'running' | 'waiting' | 'finished' | 'failed';
 
+export type WorkerKind = 'feature' | 'investigation';
+
 export type AlertSource = 'prometheus' | 'glitchtip';
 
 export interface IngestChannel {
@@ -52,6 +54,7 @@ export interface WorkerRecord {
   repoPath: string;
   sessionId: string | null;
   status: WorkerStatus;
+  kind: WorkerKind;
   task: string;
   createdAt: number;
   updatedAt: number;
