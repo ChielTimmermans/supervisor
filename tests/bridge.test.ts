@@ -19,6 +19,7 @@ function fakeGateway(posts: any[]): Gateway {
 
 const cfg = {
   repos: { acme: { path: '/repo/acme', description: 'API' } },
+  ingestChannels: [], serviceRepoMap: {}, incidentCooldownMs: 3_600_000,
   workerConcurrency: 3, askUserTimeoutMs: 1000, attachmentDir: './scratch',
   mattermost: { url: '', token: '', channelId: 'c' }, dbPath: ':memory:',
 } as Config;

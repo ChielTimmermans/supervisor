@@ -12,12 +12,13 @@ async function main() {
   const cfg = loadConfig(process.env, process.env.REPOS_JSON ?? '{}');
   log.info('starting supervisor', {
     channel: cfg.mattermost.channelId,
+    ingest: cfg.ingestChannels.map((c) => `${c.channelId}:${c.source}`).join(',') || '(none)',
     repos: Object.keys(cfg.repos).join(',') || '(none)',
     concurrency: cfg.workerConcurrency,
   });
   await mkdir(path.dirname(cfg.dbPath), { recursive: true });
   const db = new Db(cfg.dbPath);
-  const gateway = new MattermostGateway(cfg.mattermost);
+  const gateway = new MattermostGateway(cfg.mattermost, cfg.ingestChannels.map((c) => c.channelId));
   const bridge = new Bridge({ queryFn: query, gateway, db, cfg });
   await bridge.start();
   log.info('bridge online');

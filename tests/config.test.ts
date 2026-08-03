@@ -29,4 +29,26 @@ describe('loadConfig', () => {
     expect(c.workerConcurrency).toBe(3);
     expect(c.askUserTimeoutMs).toBe(86_400_000);
   });
+
+  it('defaults ingest/monitoring config when absent', () => {
+    const c = loadConfig(base, repos);
+    expect(c.ingestChannels).toEqual([]);
+    expect(c.serviceRepoMap).toEqual({});
+    expect(c.incidentCooldownMs).toBe(3_600_000);
+  });
+
+  it('parses ingest channels, service→repo map, and cooldown', () => {
+    const c = loadConfig({
+      ...base,
+      INGEST_CHANNELS_JSON: '[{"channelId":"c-infra","source":"prometheus"},{"channelId":"c-app","source":"glitchtip"}]',
+      SERVICE_REPO_MAP_JSON: '{"console-frontend":"chipmakers"}',
+      INCIDENT_COOLDOWN_MS: '5000',
+    } as any, repos);
+    expect(c.ingestChannels).toEqual([
+      { channelId: 'c-infra', source: 'prometheus' },
+      { channelId: 'c-app', source: 'glitchtip' },
+    ]);
+    expect(c.serviceRepoMap['console-frontend']).toBe('chipmakers');
+    expect(c.incidentCooldownMs).toBe(5000);
+  });
 });

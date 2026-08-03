@@ -36,10 +36,13 @@ export class MattermostGateway implements Gateway {
   private client = new Client4();
   private ws?: WebSocketClient;
   private botId = '';
+  private inbound: Set<string>;
 
-  constructor(private cfg: Config['mattermost']) {
+  constructor(private cfg: Config['mattermost'], ingestChannelIds: string[] = []) {
     this.client.setUrl(cfg.url);
     this.client.setToken(cfg.token);
+    // Inbound posts are accepted from the main channel plus every ingest channel.
+    this.inbound = new Set([cfg.channelId, ...ingestChannelIds]);
   }
 
   getBotId(): string { return this.botId; }
@@ -47,7 +50,7 @@ export class MattermostGateway implements Gateway {
   async connect(onPost: (p: IncomingPost) => void): Promise<void> {
     const me = await this.client.getMe();
     this.botId = me.id;
-    log.info('mattermost connected', { bot: `${me.username}(${me.id})`, channel: this.cfg.channelId });
+    log.info('mattermost connected', { bot: `${me.username}(${me.id})`, channels: [...this.inbound].join(',') });
 
     const ws = new WebSocketClient({
       newWebSocketFn: (url: string) => new WebSocket(url) as unknown as globalThis.WebSocket,
@@ -59,7 +62,7 @@ export class MattermostGateway implements Gateway {
     ws.addErrorListener((err: unknown) => log.error('websocket error', { err: err instanceof Error ? err.message : String(err) }));
     ws.addMessageListener((msg) => {
       if (msg.event !== 'posted') return;
-      if (msg.broadcast.channel_id !== this.cfg.channelId) return;
+      if (!this.inbound.has(msg.broadcast.channel_id)) return;
       const data = (msg as WebSocketMessages.Posted).data;
       const raw = JSON.parse(data.post) as Post;
       const p = normalizeIncomingPost(raw, this.botId);
