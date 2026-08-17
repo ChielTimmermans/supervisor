@@ -11,7 +11,9 @@ function fakeGateway(posts: any[], uploads: string[]): Gateway {
     getBotId: () => 'bot', connect: async () => {},
     post: async (a) => { posts.push(a); return 'p' + posts.length; },
     uploadFile: async (f) => { uploads.push(f); return 'file-' + uploads.length; },
-    downloadFile: async (_i, d) => d, close: () => {},
+    downloadFile: async (_i, d) => d,
+    addReaction: async () => {}, removeReaction: async () => {},
+    close: () => {},
   };
 }
 const queryFn = ((args: any) => (async function* () {

@@ -13,8 +13,8 @@ function makeQueryFn(sink: { pushed: string[] }) {
   })()) as any;
 }
 
-function fakeGateway(posts: any[]): Gateway {
-  return { getBotId: () => 'bot', connect: async () => {}, post: async (a) => { posts.push(a); return 'p' + posts.length; }, uploadFile: async () => 'f', downloadFile: async (_i, d) => d, close: () => {} };
+function fakeGateway(posts: any[], reactions: [string, string][] = []): Gateway {
+  return { getBotId: () => 'bot', connect: async () => {}, post: async (a) => { posts.push(a); return 'p' + posts.length; }, uploadFile: async () => 'f', downloadFile: async (_i, d) => d, addReaction: async (postId, emoji) => { reactions.push([postId, emoji]); }, removeReaction: async () => {}, close: () => {} };
 }
 
 const cfg = {
@@ -26,10 +26,10 @@ const cfg = {
 
 const post = (o: Partial<IncomingPost>): IncomingPost => ({ id: 'p', channelId: 'c', rootId: '', message: 'm', userId: 'u', fileIds: [], isOwn: false, ...o });
 
-let db: Db; let posts: any[]; let sink: { pushed: string[] }; let bridge: Bridge;
+let db: Db; let posts: any[]; let reactions: [string, string][]; let sink: { pushed: string[] }; let bridge: Bridge;
 beforeEach(async () => {
-  db = new Db(':memory:'); posts = []; sink = { pushed: [] };
-  bridge = new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db, cfg });
+  db = new Db(':memory:'); posts = []; reactions = []; sink = { pushed: [] };
+  bridge = new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts, reactions), db, cfg });
   await bridge.start();
 });
 
@@ -44,6 +44,13 @@ describe('Bridge', () => {
     expect(res.ok).toBe(true);
     expect(db.getWorkerByThread('root1')?.repoName).toBe('acme');
     await vi.waitFor(() => expect(sink.pushed).toContain('add x'));
+    await vi.waitFor(() => expect(reactions).toContainEqual(['root1', 'hourglass_flowing_sand']));
+  });
+
+  it('marks a worker thread failed with the ❌ reaction', async () => {
+    const res = (bridge as any).spawnWorker({ repo: 'acme', task: 'add x', threadRootId: 'root-fail' });
+    (bridge as any).markFailed(res.workerId, 'boom');
+    await vi.waitFor(() => expect(reactions).toContainEqual(['root-fail', 'x']));
   });
 
   it('a thread reply to a waiting worker resolves its question', async () => {
@@ -96,9 +103,9 @@ describe('Bridge', () => {
       streamEnded.push('ended');
     })()) as any;
 
-    const posts3: any[] = [];
+    const posts3: any[] = []; const reactions3: [string, string][] = [];
     const db3 = new Db(':memory:');
-    const bridge3 = new Bridge({ queryFn, gateway: fakeGateway(posts3), db: db3, cfg });
+    const bridge3 = new Bridge({ queryFn, gateway: fakeGateway(posts3, reactions3), db: db3, cfg });
     await bridge3.start();
 
     const res = (bridge3 as any).spawnWorker({ repo: 'acme', task: 'do it', threadRootId: 'root-fin' });
@@ -112,6 +119,7 @@ describe('Bridge', () => {
     expect((bridge3 as any).workers.has(id)).toBe(false);
     expect(db3.getWorker(id)!.status).toBe('finished');
     expect(posts3.some((p) => p.threadRootId === 'root-fin' && /closed/i.test(p.text))).toBe(true);
+    await vi.waitFor(() => expect(reactions3).toContainEqual(['root-fin', 'white_check_mark']));
     // The deferred stop() actually closed the prompt stream (loop ended).
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
   });

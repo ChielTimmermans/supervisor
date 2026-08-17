@@ -6,7 +6,7 @@ import type { Config } from '../src/config.js';
 import type { Gateway } from '../src/mattermost.js';
 
 function fakeGateway(): Gateway {
-  return { getBotId: () => 'bot', connect: async () => {}, post: async () => 'p', uploadFile: async () => 'f', downloadFile: async (_i, d) => d, close: () => {} };
+  return { getBotId: () => 'bot', connect: async () => {}, post: async () => 'p', uploadFile: async () => 'f', downloadFile: async (_i, d) => d, addReaction: async () => {}, removeReaction: async () => {}, close: () => {} };
 }
 const cfg = { attachmentDir: './scratch', askUserTimeoutMs: 1000, repos: {}, mattermost: { url: '', token: '', channelId: '' }, workerConcurrency: 1, dbPath: ':memory:' } as Config;
 
@@ -49,6 +49,47 @@ describe('Worker', () => {
     await vi.waitFor(() => expect(db.getWorker('w1')!.status).toBe('failed'));
     expect(posts.some((p) => p.threadRootId === 't1' && p.text.includes('stale resume session'))).toBe(true);
     expect(finished).toBe(true);
+  });
+
+  it('attaches a cluster-write guard hook for investigation workers', async () => {
+    const seenOptions: any[] = [];
+    const queryFn = ((args: any) => (async function* () {
+      seenOptions.push(args.options);
+      yield { type: 'system', session_id: 'ws-1' };
+      for await (const _m of args.prompt) { /* drain */ }
+    })()) as any;
+
+    const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: '(none)', repoPath: '/scratch/w1', task: 'diagnose', kind: 'investigation' });
+    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {} });
+    w.start();
+
+    await vi.waitFor(() => expect(seenOptions.length).toBe(1));
+    const matcher = seenOptions[0].hooks?.PreToolUse?.[0];
+    expect(matcher?.matcher).toBe('Bash');
+    const hook = matcher.hooks[0];
+
+    const denied = await hook({ tool_name: 'Bash', tool_input: { command: 'kubectl delete pod api-0 -n prod' } }, 'u1', { signal: new AbortController().signal });
+    expect(denied.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(denied.hookSpecificOutput.permissionDecisionReason).toMatch(/kubectl/i);
+
+    const allowed = await hook({ tool_name: 'Bash', tool_input: { command: 'kubectl get pods -n prod' } }, 'u2', { signal: new AbortController().signal });
+    expect(allowed.hookSpecificOutput?.permissionDecision).not.toBe('deny');
+  });
+
+  it('does not attach the guard hook for feature workers', async () => {
+    const seenOptions: any[] = [];
+    const queryFn = ((args: any) => (async function* () {
+      seenOptions.push(args.options);
+      yield { type: 'system', session_id: 'ws-1' };
+      for await (const _m of args.prompt) { /* drain */ }
+    })()) as any;
+
+    const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'acme', repoPath: '/repo/acme', task: 'feature', kind: 'feature' });
+    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {} });
+    w.start();
+
+    await vi.waitFor(() => expect(seenOptions.length).toBe(1));
+    expect(seenOptions[0].hooks).toBeUndefined();
   });
 
   it('inject appends attachment paths to the pushed message', async () => {

@@ -5,7 +5,7 @@ import type { Config } from '../src/config.js';
 import type { Gateway } from '../src/mattermost.js';
 
 function fakeGateway(posts: any[]): Gateway {
-  return { getBotId: () => 'bot', connect: async () => {}, post: async (a) => { posts.push(a); return 'p'; }, uploadFile: async () => 'f', downloadFile: async (_i, d) => d, close: () => {} };
+  return { getBotId: () => 'bot', connect: async () => {}, post: async (a) => { posts.push(a); return 'p'; }, uploadFile: async () => 'f', downloadFile: async (_i, d) => d, addReaction: async () => {}, removeReaction: async () => {}, close: () => {} };
 }
 const cfg = { repos: { acme: { path: '/repo/acme', description: 'API' } } } as unknown as Config;
 

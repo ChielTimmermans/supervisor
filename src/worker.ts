@@ -1,5 +1,7 @@
 import { ClaudeSession, type QueryFn } from './session.js';
 import { createWorkerToolServer } from './tools/workerTools.js';
+import { inspectBashCommand } from './guard.js';
+import { applyThreadStatus } from './threadStatus.js';
 import { log } from './log.js';
 import { PendingQuestions } from './pending.js';
 import type { Gateway } from './mattermost.js';
@@ -44,6 +46,27 @@ export class Worker {
 
   get id(): string { return this.deps.record.id; }
 
+  /**
+   * Defense-in-depth for investigation workers: a PreToolUse hook that denies Bash
+   * commands mutating the cluster/monitoring backends. `permissionDecision: 'deny'`
+   * blocks the call even under bypassPermissions. Cluster RBAC remains the real boundary.
+   */
+  private clusterWriteGuardHooks(): Record<string, unknown> | undefined {
+    if (this.deps.record.kind !== 'investigation') return undefined;
+    const workerId = this.deps.record.id;
+    const preToolUse = async (input: { tool_name: string; tool_input: unknown }) => {
+      if (input.tool_name !== 'Bash') return { continue: true };
+      const command = (input.tool_input as { command?: string })?.command ?? '';
+      const verdict = inspectBashCommand(command);
+      if (!verdict.blocked) return { continue: true };
+      log.warn('blocked cluster write', { worker: workerId, cmd: command });
+      return {
+        hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: verdict.reason },
+      };
+    };
+    return { PreToolUse: [{ matcher: 'Bash', hooks: [preToolUse] }] };
+  }
+
   private buildSession(resume?: string): ClaudeSession {
     const { server, toolNames } = createWorkerToolServer({
       gateway: this.deps.gateway, db: this.deps.db, pending: this.deps.pending,
@@ -59,12 +82,14 @@ export class Worker {
         allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', ...toolNames],
         env: { ...process.env as Record<string, string>, MCP_TIMEOUT: String(this.deps.cfg.askUserTimeoutMs) },
         resume,
+        hooks: this.clusterWriteGuardHooks(),
       },
       (id) => { log.debug('worker session id', { worker: this.deps.record.id, session: id }); this.deps.db.updateWorker(this.deps.record.id, { sessionId: id }); },
       (err) => {
         log.error('worker session error', { worker: this.deps.record.id, err: err instanceof Error ? err.message : String(err) });
         this.deps.db.updateWorker(this.deps.record.id, { status: 'failed' });
         void this.deps.gateway.post({ text: `Worker hit a fatal session error: ${err instanceof Error ? err.message : String(err)}`, threadRootId: this.deps.record.threadRootId });
+        void applyThreadStatus(this.deps.gateway, this.deps.record.threadRootId, 'failed');
         this.deps.onFinish();
       },
     );
