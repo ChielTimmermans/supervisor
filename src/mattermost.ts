@@ -29,6 +29,8 @@ export interface Gateway {
   post(args: { text: string; threadRootId?: string; fileIds?: string[] }): Promise<string>;
   uploadFile(filePath: string): Promise<string>;
   downloadFile(fileId: string, destPath: string): Promise<string>;
+  addReaction(postId: string, emoji: string): Promise<void>;
+  removeReaction(postId: string, emoji: string): Promise<void>;
   close(): void;
 }
 
@@ -92,6 +94,14 @@ export class MattermostGateway implements Gateway {
     form.append('files', new Blob([bytes]), basename(filePath));
     const res = await this.client.uploadFile(form);
     return res.file_infos[0].id;
+  }
+
+  async addReaction(postId: string, emoji: string): Promise<void> {
+    await this.client.addReaction(this.botId, postId, emoji);
+  }
+
+  async removeReaction(postId: string, emoji: string): Promise<void> {
+    await this.client.removeReaction(this.botId, postId, emoji);
   }
 
   async downloadFile(fileId: string, destPath: string): Promise<string> {

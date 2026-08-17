@@ -4,15 +4,17 @@ import { PendingQuestions } from '../src/pending.js';
 import { askUserHandler, sendUpdateHandler, finishHandler, type WorkerToolDeps } from '../src/tools/workerTools.js';
 import type { Gateway } from '../src/mattermost.js';
 
-function fakeGateway(): Gateway & { posts: any[]; uploads: string[] } {
-  const posts: any[] = []; const uploads: string[] = [];
+function fakeGateway(): Gateway & { posts: any[]; uploads: string[]; reactions: [string, string][] } {
+  const posts: any[] = []; const uploads: string[] = []; const reactions: [string, string][] = [];
   return {
-    posts, uploads,
+    posts, uploads, reactions,
     getBotId: () => 'bot',
     connect: async () => {},
     post: async (a) => { posts.push(a); return 'post-' + posts.length; },
     uploadFile: async (p) => { uploads.push(p); return 'file-' + uploads.length; },
     downloadFile: async (_id, dest) => dest,
+    addReaction: async (postId, emoji) => { reactions.push([postId, emoji]); },
+    removeReaction: async () => {},
     close: () => {},
   };
 }
@@ -31,10 +33,12 @@ describe('worker tools', () => {
     const p = askUserHandler(deps, { question: 'proceed?' });
     await vi.waitFor(() => expect(gateway.posts[0]).toMatchObject({ text: 'proceed?', threadRootId: 't1' }));
     expect(db.getWorker('w1')!.status).toBe('waiting');
+    await vi.waitFor(() => expect(gateway.reactions).toContainEqual(['t1', 'raised_hand']));
     pending.resolve('w1', 'yes');
     const result = await p;
     expect(result.content[0].text).toContain('yes');
     expect(db.getWorker('w1')!.status).toBe('running');
+    await vi.waitFor(() => expect(gateway.reactions).toContainEqual(['t1', 'hourglass_flowing_sand']));
   });
 
   it('send_update uploads files and posts with file ids', async () => {
@@ -51,6 +55,7 @@ describe('worker tools', () => {
     expect(gateway.posts[0].text).toContain('/done');
     // finish no longer marks the worker finished — completion is the operator's call.
     expect(db.getWorker('w1')!.status).toBe('running');
+    await vi.waitFor(() => expect(gateway.reactions).toContainEqual(['t1', 'checkered_flag']));
     expect(res.content[0].text).toBeDefined();
   });
 });

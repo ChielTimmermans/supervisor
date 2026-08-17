@@ -7,6 +7,7 @@ import { PendingQuestions } from './pending.js';
 import { Worker } from './worker.js';
 import { Supervisor } from './supervisor.js';
 import { createSupervisorToolServer, type SupervisorToolDeps } from './tools/supervisorTools.js';
+import { applyThreadStatus } from './threadStatus.js';
 import { log, preview } from './log.js';
 import type { QueryFn } from './session.js';
 import type { Gateway } from './mattermost.js';
@@ -48,6 +49,7 @@ export class Bridge {
       try {
         worker.startResumed();
         this.workers.set(rec.id, worker);
+        void applyThreadStatus(this.deps.gateway, rec.threadRootId, rec.status === 'waiting' ? 'waiting' : 'running');
         log.info('resumed worker', { worker: rec.id, repo: rec.repoName, thread: rec.threadRootId });
         const openQ = this.deps.db.getOpenQuestionForWorker(rec.id);
         if (openQ) {
@@ -105,6 +107,7 @@ export class Bridge {
     });
     worker.start();
     this.workers.set(rec.id, worker);
+    void applyThreadStatus(this.deps.gateway, rec.threadRootId, 'running');
   }
 
   private stopWorker(id: string): void {
@@ -125,6 +128,7 @@ export class Bridge {
       const inc = this.deps.db.getIncidentByThread(rec.threadRootId);
       if (inc && inc.status !== 'closed') this.deps.db.setIncidentStatus(inc.id, 'closed');
       void this.deps.gateway.post({ text: 'Closed this thread. 🎉', threadRootId: rec.threadRootId });
+      void applyThreadStatus(this.deps.gateway, rec.threadRootId, 'done');
     }
     log.info('closed worker (operator /done)', { worker: id });
   }
@@ -133,7 +137,10 @@ export class Bridge {
     log.warn('worker failed', { worker: id, reason });
     this.deps.db.updateWorker(id, { status: 'failed' });
     const rec = this.deps.db.getWorker(id);
-    if (rec) void this.deps.gateway.post({ text: `Worker could not be restored: ${reason}`, threadRootId: rec.threadRootId });
+    if (rec) {
+      void this.deps.gateway.post({ text: `Worker could not be restored: ${reason}`, threadRootId: rec.threadRootId });
+      void applyThreadStatus(this.deps.gateway, rec.threadRootId, 'failed');
+    }
   }
 
   private async downloadAttachments(post: IncomingPost): Promise<string[]> {

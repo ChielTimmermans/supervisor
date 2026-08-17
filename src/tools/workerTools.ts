@@ -2,6 +2,7 @@ import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { log, preview } from '../log.js';
+import { applyThreadStatus } from '../threadStatus.js';
 import type { Gateway } from '../mattermost.js';
 import type { Db } from '../db.js';
 import type { PendingQuestions } from '../pending.js';
@@ -20,9 +21,12 @@ const text = (t: string): ToolResult => ({ content: [{ type: 'text', text: t }] 
 export async function askUserHandler(deps: WorkerToolDeps, args: { question: string }): Promise<ToolResult> {
   const postId = await deps.gateway.post({ text: args.question, threadRootId: deps.threadRootId });
   deps.db.updateWorker(deps.workerId, { status: 'waiting' });
+  // Fire-and-forget: reacting must not delay arming pending.ask, or a fast reply would race in unresolved.
+  void applyThreadStatus(deps.gateway, deps.threadRootId, 'waiting');
   log.info('worker asks — waiting for reply', { worker: deps.workerId, q: preview(args.question) });
   const answer = await deps.pending.ask({ workerId: deps.workerId, questionPostId: postId });
   deps.db.updateWorker(deps.workerId, { status: 'running' });
+  void applyThreadStatus(deps.gateway, deps.threadRootId, 'running');
   log.info('worker got reply — resuming', { worker: deps.workerId });
   return text(`The operator replied: ${answer}`);
 }
@@ -40,6 +44,7 @@ export async function finishHandler(deps: WorkerToolDeps, args: { summary: strin
     text: `✅ I believe this feature is complete:\n\n${args.summary}\n\n_Reply with any changes to keep going, or type \`/done\` to close this thread._`,
     threadRootId: deps.threadRootId,
   });
+  void applyThreadStatus(deps.gateway, deps.threadRootId, 'proposed');
   log.info('worker proposed completion', { worker: deps.workerId });
   return text('Completion proposed to the operator. Do NOT end the feature yourself — the operator decides. Wait for their reply: they will either request more changes (address them, then call finish again) or close the thread with /done.');
 }

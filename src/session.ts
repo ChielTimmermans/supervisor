@@ -11,6 +11,7 @@ export interface SessionOptions {
   disallowedTools?: string[];
   env?: Record<string, string>;
   resume?: string;
+  hooks?: Record<string, unknown>;
 }
 
 // Minimal async queue: an async-iterable you can push to and close.
@@ -79,6 +80,7 @@ export class ClaudeSession {
       disallowedTools: this.opts.disallowedTools,
       env: this.opts.env,
       resume: this.opts.resume,
+      hooks: this.opts.hooks,
     };
     if (this.opts.systemPromptAppend) {
       options.systemPrompt = { type: 'preset', preset: 'claude_code', append: this.opts.systemPromptAppend };
