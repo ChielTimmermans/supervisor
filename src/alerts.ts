@@ -16,6 +16,16 @@ function firstUrl(message: string): string | undefined {
   return message.match(/https?:\/\/\S+/)?.[0]?.replace(/[)>.,]+$/, '');
 }
 
+/** Read a "Key: value" (or "Key - value") field line from flattened attachment text. */
+function fieldValue(lines: string[], key: string): string | undefined {
+  const re = new RegExp(`^${key}\\s*[:=\\-]\\s*(.+)$`, 'i');
+  for (const l of lines) {
+    const m = l.match(re);
+    if (m) return m[1].trim() || undefined;
+  }
+  return undefined;
+}
+
 const SEVERITY_BY_EMOJI: Record<string, string> = {
   ':red_circle:': 'critical',
   ':warning:': 'warning',
@@ -71,10 +81,12 @@ export function parseGlitchtip(message: string): AlertEvent | null {
   const errorTitle = (headerIdx >= 0 ? afterHeader[0] : nonEmpty[0]) ?? '';
   if (!errorTitle) return null;
 
-  // Best-effort Project / Environment extraction from the fields block.
-  const fieldsIdx = lines.findIndex((l) => /project/i.test(l) && /environment/i.test(l));
+  // Best-effort Project / Environment extraction. Two shapes occur:
+  //  (a) a side-by-side grid: "Project    Environment" header, values on the next lines;
+  //  (b) flattened attachment fields: "Project: <value>" / "Environment: <value>" per line.
   let service: string | undefined;
   let environment: string | undefined;
+  const fieldsIdx = lines.findIndex((l) => /project/i.test(l) && /environment/i.test(l));
   if (fieldsIdx >= 0) {
     const vals = lines
       .slice(fieldsIdx + 1)
@@ -85,6 +97,8 @@ export function parseGlitchtip(message: string): AlertEvent | null {
     service = vals[0];
     environment = vals[1];
   }
+  service ??= fieldValue(lines, 'project');
+  environment ??= fieldValue(lines, 'environment');
 
   const norm = normalizeErrorTitle(errorTitle);
   const key = service ? `${service}|${environment ?? ''}|${norm}` : norm;

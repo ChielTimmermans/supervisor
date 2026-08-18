@@ -11,12 +11,38 @@ export function threadRootOf(post: { id: string; root_id: string }): string {
   return post.root_id || post.id;
 }
 
+interface RawAttachmentField { title?: string; value?: unknown }
+interface RawAttachment { pretext?: string; title?: string; title_link?: string; text?: string; fields?: RawAttachmentField[] | null }
+
+/**
+ * Flatten Mattermost message attachments (`props.attachments[]`) to plain text.
+ * Webhook integrations (e.g. GlitchTip) carry the real payload here while the
+ * bare `message` is just a header, so the alert parsers need this content.
+ */
+export function flattenAttachments(props: unknown): string {
+  const attachments = (props as { attachments?: RawAttachment[] } | null | undefined)?.attachments;
+  if (!Array.isArray(attachments)) return '';
+  const lines: string[] = [];
+  for (const a of attachments) {
+    for (const v of [a.pretext, a.title, a.title_link, a.text]) {
+      if (typeof v === 'string' && v.trim()) lines.push(v.trim());
+    }
+    for (const f of a.fields ?? []) {
+      const key = (f.title ?? '').trim();
+      const val = f.value == null ? '' : String(f.value).trim();
+      if (key || val) lines.push(key && val ? `${key}: ${val}` : key || val);
+    }
+  }
+  return lines.join('\n');
+}
+
 export function normalizeIncomingPost(raw: Post, botUserId: string): IncomingPost {
+  const attachmentText = flattenAttachments(raw.props);
   return {
     id: raw.id,
     channelId: raw.channel_id,
     rootId: raw.root_id || '',
-    message: raw.message,
+    message: [raw.message, attachmentText].filter(Boolean).join('\n'),
     userId: raw.user_id,
     fileIds: raw.file_ids ?? [],
     isOwn: raw.user_id === botUserId,

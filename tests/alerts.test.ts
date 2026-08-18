@@ -50,6 +50,13 @@ describe('parsePrometheus', () => {
   });
 });
 
+// Flattened form of a webhook post whose alert lives in attachment fields (Key: Value lines).
+const GLITCH_ATTACHMENT = `GlitchTip Alert (2 issues)
+TypeError: Failed to fetch dynamically imported module: https://console.thechipmakers.dev/chunk-V4Jabc123.js
+https://console.thechipmakers.dev/issues/1
+Project: console-frontend
+Environment: development`;
+
 describe('parseGlitchtip', () => {
   it('parses the error, project, and a firing status', () => {
     const e = parseGlitchtip(GLITCH_V1)!;
@@ -57,6 +64,13 @@ describe('parseGlitchtip', () => {
     expect(e.summary).toContain('Failed to fetch dynamically imported module');
     expect(e.service).toBe('console-frontend');
     expect(e.fingerprint.startsWith('glitchtip:')).toBe(true);
+  });
+
+  it('extracts the error and service from flattened attachment "Key: Value" fields', () => {
+    const e = parseGlitchtip(GLITCH_ATTACHMENT)!;
+    expect(e.status).toBe('firing');
+    expect(e.summary).toContain('Failed to fetch dynamically imported module');
+    expect(e.service).toBe('console-frontend');
   });
 
   it('de-dups across deploys: same error, different chunk hash → same fingerprint', () => {
