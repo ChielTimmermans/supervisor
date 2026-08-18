@@ -19,4 +19,26 @@ describe('mattermost helpers', () => {
     expect(p.fileIds).toEqual([]);
     expect(p.isOwn).toBe(false);
   });
+
+  it('normalizeIncomingPost folds webhook attachments (title/text/fields) into the message', () => {
+    const raw = {
+      id: 'p3', channel_id: 'c1', root_id: '', user_id: 'u1',
+      message: 'GlitchTip Alert (2 issues)',
+      props: {
+        attachments: [{
+          title: 'TypeError: Failed to fetch dynamically imported module: https://console.thechipmakers.dev/chunk-V4Jabc123.js',
+          title_link: 'https://console.thechipmakers.dev/issues/1',
+          fields: [
+            { title: 'Project', value: 'console-frontend' },
+            { title: 'Environment', value: 'development' },
+          ],
+        }],
+      },
+    };
+    const p = normalizeIncomingPost(raw as any, 'bot');
+    expect(p.message).toContain('GlitchTip Alert');
+    expect(p.message).toContain('Failed to fetch dynamically imported module');
+    expect(p.message).toContain('console-frontend');
+    expect(p.message).toContain('development');
+  });
 });
