@@ -137,6 +137,15 @@ describe('Bridge', () => {
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
   });
 
+  it('operator /done in a thread with no worker closes the thread instead of routing to the supervisor', async () => {
+    // Thread handled by the supervisor directly — no worker was ever spawned.
+    await bridge.handlePost(post({ id: 'd2', rootId: 'root-noworker', message: '/done' }));
+    expect(posts.some((p) => p.threadRootId === 'root-noworker' && /closed/i.test(p.text))).toBe(true);
+    await vi.waitFor(() => expect(reactions).toContainEqual(['root-noworker', 'white_check_mark']));
+    // Consumed, not forwarded to the supervisor.
+    expect(sink.pushed.some((m) => m.includes('/done'))).toBe(false);
+  });
+
   function ingestBridge(posts: any[], sink: { pushed: string[] }, db: Db) {
     const c = { ...cfg, ingestChannels: [{ channelId: 'c-infra', source: 'prometheus' as const }] } as Config;
     return new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db, cfg: c });
@@ -266,5 +275,17 @@ describe('Bridge', () => {
       expect(inc.status).toBe('open');
       expect(inc.workerId).toBeTruthy();
     });
+  });
+
+  it('/done after the investigation worker already finished still closes the incident', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridge(p, s, d); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] CrashLoop\nx'));
+    const inc = d.getOpenIncidentByFingerprint('prometheus:CrashLoop')!;
+    (b as any).stopWorker(inc.workerId); // worker finished on its own — no longer live
+    await b.handlePost(post({ id: 'done2', channelId: 'c', rootId: inc.threadRootId, message: '/done' }));
+    expect(d.getIncident(inc.id)!.status).toBe('closed');
+    expect(p.some((x) => x.threadRootId === inc.threadRootId && /closed/i.test(x.text))).toBe(true);
+    expect(s.pushed.some((m) => m.includes('/done'))).toBe(false);
   });
 });

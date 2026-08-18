@@ -187,6 +187,15 @@ export class Bridge {
     log.info('closed queued incident (operator /done)', { incident: inc.id });
   }
 
+  /** Operator closes a thread with no known worker or open incident (via `/done`): confirm only. */
+  private closeThread(threadRootId: string): void {
+    const inc = this.deps.db.getIncidentByThread(threadRootId);
+    if (inc && inc.status !== 'closed') this.deps.db.setIncidentStatus(inc.id, 'closed');
+    void this.deps.gateway.post({ text: 'Closed this thread. 🎉', threadRootId });
+    void applyThreadStatus(this.deps.gateway, threadRootId, 'done');
+    log.info('closed thread (operator /done, no worker or open incident)', { thread: threadRootId });
+  }
+
   private markFailed(id: string, reason: string): void {
     log.warn('worker failed', { worker: id, reason });
     this.deps.db.updateWorker(id, { status: 'failed' });
@@ -230,6 +239,9 @@ export class Bridge {
       if (w) { this.closeWorker(w.id); return; }
       const inc = this.deps.db.getIncidentByThread(post.rootId);
       if (inc && inc.status !== 'closed') { this.closeIncidentThread(inc); return; }
+      // No known worker or open incident — a plain operator thread. Still acknowledge the close.
+      this.closeThread(post.rootId);
+      return;
     }
 
     const files = post.fileIds.length ? await this.downloadAttachments(post) : [];
