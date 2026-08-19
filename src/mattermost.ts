@@ -131,7 +131,9 @@ export class MattermostGateway implements Gateway {
   }
 
   async downloadFile(fileId: string, destPath: string): Promise<string> {
-    const url = this.client.getUrl() + this.client.getFileRoute(fileId);
+    // getFileRoute already returns an absolute URL (base + /api/v4/files/<id>);
+    // prefixing getUrl() again produced a doubled host ("…comhttps://…") and a crash.
+    const url = this.client.getFileRoute(fileId);
     const resp = await fetch(url, { headers: { Authorization: `BEARER ${this.client.getToken()}` } });
     const bytes = Buffer.from(await resp.arrayBuffer());
     await writeFile(destPath, bytes);

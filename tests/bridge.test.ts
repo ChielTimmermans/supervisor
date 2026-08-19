@@ -63,6 +63,19 @@ describe('Bridge', () => {
     await expect(p).resolves.toContain('go ahead');
   });
 
+  it('handles a post whose attachment download fails, without dropping the message', async () => {
+    const db4 = new Db(':memory:');
+    const s4 = { pushed: [] as string[] };
+    const gw: Gateway = { ...fakeGateway([]), downloadFile: async () => { throw new Error('fetch failed'); } };
+    const b4 = new Bridge({ queryFn: makeQueryFn(s4), gateway: gw, db: db4, cfg });
+    await b4.start();
+
+    await expect(
+      b4.handlePost(post({ id: 'root9', rootId: '', message: 'look at this file', fileIds: ['f1'] })),
+    ).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(s4.pushed.some((m) => m.includes('look at this file'))).toBe(true));
+  });
+
   it('enforces the concurrency cap', () => {
     const small = new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db: new Db(':memory:'), cfg: { ...cfg, workerConcurrency: 1 } });
     const a = (small as any).spawnWorker({ repo: 'acme', task: 'a', threadRootId: 't1' });
