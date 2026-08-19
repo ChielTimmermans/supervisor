@@ -20,7 +20,7 @@ export interface AlertEvent {
   sourceUrl?: string;
 }
 
-export type IncidentStatus = 'open' | 'resolved_upstream' | 'closed';
+export type IncidentStatus = 'queued' | 'open' | 'resolved_upstream' | 'closed';
 
 export interface IncidentRecord {
   id: string;

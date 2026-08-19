@@ -9,6 +9,7 @@ export interface Config {
   serviceRepoMap: Record<string, string>;
   incidentCooldownMs: number;
   workerConcurrency: number;
+  investigationConcurrency: number;
   askUserTimeoutMs: number;
   attachmentDir: string;
   dbPath: string;
@@ -34,6 +35,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, reposJson: string): Config {
     serviceRepoMap: env.SERVICE_REPO_MAP_JSON ? JSON.parse(env.SERVICE_REPO_MAP_JSON) as Record<string, string> : {},
     incidentCooldownMs: env.INCIDENT_COOLDOWN_MS ? Number(env.INCIDENT_COOLDOWN_MS) : 3_600_000,
     workerConcurrency: env.WORKER_CONCURRENCY ? Number(env.WORKER_CONCURRENCY) : 3,
+    investigationConcurrency: env.INVESTIGATION_CONCURRENCY ? Number(env.INVESTIGATION_CONCURRENCY) : 2,
     askUserTimeoutMs: env.ASK_USER_TIMEOUT_MS ? Number(env.ASK_USER_TIMEOUT_MS) : 86_400_000,
     attachmentDir: env.ATTACHMENT_DIR ?? './scratch/attachments',
     dbPath: env.DB_PATH ?? './data/supervisor.sqlite',

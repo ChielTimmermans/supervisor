@@ -134,12 +134,13 @@ export class Db {
   createIncident(i: {
     id: string; fingerprint: string; source: AlertSource; service: string | null;
     repoName: string | null; threadRootId: string; workerId: string | null; summary: string;
+    status?: IncidentStatus;
   }): IncidentRecord {
     const now = Date.now();
     this.db.prepare(
       `INSERT INTO incidents (id, fingerprint, source, service, repo_name, thread_root_id, worker_id, status, summary, created_at, last_seen_at, refire_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 1)`
-    ).run(i.id, i.fingerprint, i.source, i.service, i.repoName, i.threadRootId, i.workerId, i.summary, now, now);
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+    ).run(i.id, i.fingerprint, i.source, i.service, i.repoName, i.threadRootId, i.workerId, i.status ?? 'open', i.summary, now, now);
     return this.getIncident(i.id)!;
   }
 
@@ -164,6 +165,15 @@ export class Db {
 
   listOpenIncidents(): IncidentRecord[] {
     return this.db.prepare(`SELECT * FROM incidents WHERE status != 'closed' ORDER BY created_at`).all().map((r) => this.incidentRow(r));
+  }
+
+  listQueuedIncidents(): IncidentRecord[] {
+    return this.db.prepare(`SELECT * FROM incidents WHERE status = 'queued' ORDER BY created_at`).all().map((r) => this.incidentRow(r));
+  }
+
+  /** Bind a drained investigation worker to a queued incident and open it. */
+  assignIncidentWorker(id: string, workerId: string): void {
+    this.db.prepare(`UPDATE incidents SET worker_id = ?, status = 'open', last_seen_at = ? WHERE id = ?`).run(workerId, Date.now(), id);
   }
 
   recordRefire(id: string): void {

@@ -27,7 +27,13 @@ describe('loadConfig', () => {
   it('defaults concurrency and timeout when absent', () => {
     const c = loadConfig({ ...base, WORKER_CONCURRENCY: undefined, ASK_USER_TIMEOUT_MS: undefined } as any, repos);
     expect(c.workerConcurrency).toBe(3);
+    expect(c.investigationConcurrency).toBe(2);
     expect(c.askUserTimeoutMs).toBe(86_400_000);
+  });
+
+  it('parses investigationConcurrency from env', () => {
+    const c = loadConfig({ ...base, INVESTIGATION_CONCURRENCY: '5' } as any, repos);
+    expect(c.investigationConcurrency).toBe(5);
   });
 
   it('defaults ingest/monitoring config when absent', () => {

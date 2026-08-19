@@ -52,4 +52,22 @@ describe('Db', () => {
     expect(db.getOpenIncidentByFingerprint('KubeProxyDown')).toBeUndefined();
     expect(db.listOpenIncidents()).toEqual([]);
   });
+
+  it('creates a queued incident and lists it, then assigns a worker to open it', () => {
+    const inc = db.createIncident({
+      id: 'q1', fingerprint: 'OOM', source: 'prometheus', service: null,
+      repoName: null, threadRootId: 't-q', workerId: null, summary: 'oom', status: 'queued',
+    });
+    expect(inc.status).toBe('queued');
+    expect(inc.workerId).toBeNull();
+    // still dedups re-fires (non-closed) and shows in open list
+    expect(db.getOpenIncidentByFingerprint('OOM')?.id).toBe('q1');
+    expect(db.listQueuedIncidents().map((x) => x.id)).toEqual(['q1']);
+
+    db.assignIncidentWorker('q1', 'w-drained');
+    const opened = db.getIncident('q1')!;
+    expect(opened.status).toBe('open');
+    expect(opened.workerId).toBe('w-drained');
+    expect(db.listQueuedIncidents()).toEqual([]);
+  });
 });
