@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
-import { normalizeIncomingPost, threadRootOf } from '../src/mattermost.js';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import path from 'node:path';
+import { normalizeIncomingPost, threadRootOf, MattermostGateway } from '../src/mattermost.js';
 
 describe('mattermost helpers', () => {
   it('threadRootOf returns root_id when present, else id', () => {
@@ -40,5 +41,24 @@ describe('mattermost helpers', () => {
     expect(p.message).toContain('Failed to fetch dynamically imported module');
     expect(p.message).toContain('console-frontend');
     expect(p.message).toContain('development');
+  });
+});
+
+describe('MattermostGateway.downloadFile', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('fetches the absolute file route without doubling the base URL', async () => {
+    const gw = new MattermostGateway({ url: 'https://chat.example.com', token: 't', channelId: 'c' });
+    let fetchedUrl = '';
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      fetchedUrl = String(url);
+      return { arrayBuffer: async () => new TextEncoder().encode('abc').buffer } as unknown as Response;
+    }));
+    const dest = path.join('scratch', 'dl-url-test.bin');
+
+    await gw.downloadFile('fid123', dest);
+
+    expect(fetchedUrl).toBe('https://chat.example.com/api/v4/files/fid123');
+    expect(fetchedUrl).not.toContain('.comhttps');
   });
 });

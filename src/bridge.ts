@@ -29,7 +29,10 @@ export class Bridge {
 
   async start(): Promise<void> {
     await mkdir(this.deps.cfg.attachmentDir, { recursive: true });
-    await this.deps.gateway.connect((p) => { void this.handlePost(p); });
+    await this.deps.gateway.connect((p) => {
+      // Never let a single post's handling crash the process (unhandled rejection).
+      void this.handlePost(p).catch((err) => log.error('post handling failed', { post: p.id, err: err instanceof Error ? err.message : String(err) }));
+    });
 
     // Reconcile persisted workers.
     const resumable = this.deps.db.listWorkers().filter((w) => w.status === 'running' || w.status === 'waiting');
@@ -147,7 +150,12 @@ export class Bridge {
     const out: string[] = [];
     for (const fid of post.fileIds) {
       const dest = path.join(this.deps.cfg.attachmentDir, `${post.id}-${fid}`);
-      out.push(await this.deps.gateway.downloadFile(fid, dest));
+      try {
+        out.push(await this.deps.gateway.downloadFile(fid, dest));
+      } catch (err) {
+        // A single broken attachment must not drop the whole message or crash the process.
+        log.warn('attachment download failed', { post: post.id, file: fid, err: err instanceof Error ? err.message : String(err) });
+      }
     }
     return out;
   }
