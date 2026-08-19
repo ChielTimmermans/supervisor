@@ -2,9 +2,10 @@ import { log } from './log.js';
 
 // Visual status of a worker thread, shown as a single emoji reaction on the
 // thread's root post so running vs. done threads are scannable at a glance.
-export type ThreadState = 'running' | 'waiting' | 'proposed' | 'done' | 'failed';
+export type ThreadState = 'queued' | 'running' | 'waiting' | 'proposed' | 'done' | 'failed';
 
 export const STATUS_EMOJI: Record<ThreadState, string> = {
+  queued: 'clock3',                  // 🕒 waiting for a free investigation slot
   running: 'hourglass_flowing_sand', // ⏳ worker actively working
   waiting: 'raised_hand',            // ✋ waiting on the operator
   proposed: 'checkered_flag',        // 🏁 finish proposed, awaiting /done

@@ -24,7 +24,7 @@ const queryFn = ((args: any) => (async function* () {
 const cfg = {
   repos: { acme: { path: process.cwd(), description: 'API' } },
   ingestChannels: [], serviceRepoMap: {}, incidentCooldownMs: 3_600_000,
-  workerConcurrency: 3, askUserTimeoutMs: 1000, attachmentDir: './scratch',
+  workerConcurrency: 3, investigationConcurrency: 2, askUserTimeoutMs: 1000, attachmentDir: './scratch',
   mattermost: { url: '', token: '', channelId: 'c' }, dbPath: ':memory:',
 } as Config;
 const post = (o: Partial<IncomingPost>): IncomingPost => ({ id: 'p', channelId: 'c', rootId: '', message: 'm', userId: 'u', fileIds: [], isOwn: false, ...o });

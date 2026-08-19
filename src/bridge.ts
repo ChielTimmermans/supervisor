@@ -13,7 +13,9 @@ import type { QueryFn } from './session.js';
 import type { Gateway } from './mattermost.js';
 import type { Db } from './db.js';
 import type { Config } from './config.js';
-import type { IncomingPost, WorkerRecord, AlertEvent, AlertSource } from './types.js';
+import type { IncomingPost, WorkerRecord, WorkerKind, AlertEvent, AlertSource, IncidentRecord } from './types.js';
+
+interface QueuedInvestigation { evt: AlertEvent; repoName?: string; incidentId: string; threadRootId: string }
 
 export interface BridgeDeps { queryFn: QueryFn; gateway: Gateway; db: Db; cfg: Config }
 
@@ -22,6 +24,33 @@ export class Bridge {
   private workers = new Map<string, Worker>();
   private ingest: Map<string, AlertSource>;
   private supervisor!: Supervisor;
+  private investigationQueue: QueuedInvestigation[] = [];
+  private draining = false;
+
+  /** Count live workers of a given kind (feature and investigation have independent caps). */
+  private liveCount(kind: WorkerKind): number {
+    let n = 0;
+    for (const w of this.workers.values()) if (w.kind === kind) n++;
+    return n;
+  }
+
+  /** Free-slot handler: an investigation worker went away, so try to start a queued one. */
+  private async drainQueue(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.investigationQueue.length && this.liveCount('investigation') < this.deps.cfg.investigationConcurrency) {
+        const item = this.investigationQueue.shift()!;
+        const inc = this.deps.db.getIncident(item.incidentId);
+        if (!inc || inc.status === 'closed' || inc.workerId) continue; // closed via /done or already started
+        const workerId = await this.launchInvestigationWorker(item.evt, item.repoName, item.threadRootId);
+        this.deps.db.assignIncidentWorker(item.incidentId, workerId);
+        log.info('drained queued investigation', { incident: item.incidentId, worker: workerId });
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
   constructor(private deps: BridgeDeps) {
     this.pending = new PendingQuestions(deps.db);
     this.ingest = new Map(deps.cfg.ingestChannels.map((c) => [c.channelId, c.source]));
@@ -43,11 +72,7 @@ export class Bridge {
       const worker = new Worker({
         queryFn: this.deps.queryFn, gateway: this.deps.gateway, db: this.deps.db,
         pending: this.pending, cfg: this.deps.cfg, record: rec,
-        onFinish: () => {
-          const w = this.workers.get(rec.id);
-          this.workers.delete(rec.id);
-          if (w) setImmediate(() => w.stop());
-        },
+        onFinish: () => this.onWorkerFinished(rec.id),
       });
       try {
         worker.startResumed();
@@ -73,6 +98,26 @@ export class Bridge {
     const active = this.deps.db.listWorkers().filter((w) => w.status === 'running' || w.status === 'waiting');
     this.supervisor.start(`You are online. Active workers: ${active.length ? active.map((w) => `${w.id}(${w.repoName})`).join(', ') : 'none'}.`);
     log.info('supervisor session started', { activeWorkers: active.length });
+
+    // Re-enqueue investigations that were still queued when we last stopped, then drain.
+    for (const inc of this.deps.db.listQueuedIncidents()) {
+      this.investigationQueue.push({ evt: this.incidentToEvent(inc), repoName: inc.repoName ?? undefined, incidentId: inc.id, threadRootId: inc.threadRootId });
+    }
+    if (this.investigationQueue.length) {
+      log.info('re-enqueued queued investigations', { count: this.investigationQueue.length });
+      void this.drainQueue();
+    }
+  }
+
+  private onWorkerFinished(id: string): void {
+    const w = this.workers.get(id);
+    this.workers.delete(id);
+    if (w) setImmediate(() => w.stop());
+    void this.drainQueue(); // a freed slot may let a queued investigation start
+  }
+
+  private incidentToEvent(inc: IncidentRecord): AlertEvent {
+    return { fingerprint: inc.fingerprint, status: 'firing', source: inc.source, service: inc.service ?? undefined, summary: inc.summary };
   }
 
   private supervisorDeps(): SupervisorToolDeps {
@@ -86,7 +131,7 @@ export class Bridge {
   private spawnWorker(args: { repo: string; task: string; threadRootId: string }): { ok: true; workerId: string } | { ok: false; reason: string } {
     const repo = this.deps.cfg.repos[args.repo];
     if (!repo) { log.warn('spawn rejected: unknown repo', { repo: args.repo }); return { ok: false, reason: `Unknown repo ${args.repo}` }; }
-    const active = this.workers.size;
+    const active = this.liveCount('feature');
     if (active >= this.deps.cfg.workerConcurrency) { log.warn('spawn rejected: at capacity', { active, cap: this.deps.cfg.workerConcurrency }); return { ok: false, reason: 'Concurrency limit reached' }; }
 
     const id = 'w-' + randomUUID().slice(0, 8);
@@ -102,11 +147,7 @@ export class Bridge {
     const worker = new Worker({
       queryFn: this.deps.queryFn, gateway: this.deps.gateway, db: this.deps.db,
       pending: this.pending, cfg: this.deps.cfg, record: rec,
-      onFinish: () => {
-        const w = this.workers.get(rec.id);
-        this.workers.delete(rec.id);
-        if (w) setImmediate(() => w.stop());
-      },
+      onFinish: () => this.onWorkerFinished(rec.id),
     });
     worker.start();
     this.workers.set(rec.id, worker);
@@ -134,6 +175,16 @@ export class Bridge {
       void applyThreadStatus(this.deps.gateway, rec.threadRootId, 'done');
     }
     log.info('closed worker (operator /done)', { worker: id });
+    void this.drainQueue(); // closing an investigation may free a slot for a queued one
+  }
+
+  /** Close a queued investigation that has no worker yet (operator `/done` before it started). */
+  private closeIncidentThread(inc: IncidentRecord): void {
+    this.deps.db.setIncidentStatus(inc.id, 'closed');
+    this.investigationQueue = this.investigationQueue.filter((q) => q.incidentId !== inc.id);
+    void this.deps.gateway.post({ text: 'Closed this thread. 🎉', threadRootId: inc.threadRootId });
+    void applyThreadStatus(this.deps.gateway, inc.threadRootId, 'done');
+    log.info('closed queued incident (operator /done)', { incident: inc.id });
   }
 
   private markFailed(id: string, reason: string): void {
@@ -171,11 +222,14 @@ export class Bridge {
     const alertSource = this.ingest.get(post.channelId);
     if (alertSource) { await this.handleAlert(post, alertSource); return; }
 
-    // Operator close command: `/done` (or `/close`) in a thread closes that thread's live worker.
+    // Operator close command: `/done` (or `/close`) in a thread closes it — even if the
+    // worker isn't live in memory (failed resume) or the investigation is only queued.
     const cmd = post.message.trim().toLowerCase();
     if (post.rootId !== '' && (cmd === '/done' || cmd === '/close')) {
       const w = this.deps.db.getWorkerByThread(post.rootId);
-      if (w && this.workers.has(w.id)) { this.closeWorker(w.id); return; }
+      if (w) { this.closeWorker(w.id); return; }
+      const inc = this.deps.db.getIncidentByThread(post.rootId);
+      if (inc && inc.status !== 'closed') { this.closeIncidentThread(inc); return; }
     }
 
     const files = post.fileIds.length ? await this.downloadAttachments(post) : [];
@@ -238,17 +292,30 @@ export class Bridge {
       return;
     }
 
-    // New incident → open an investigation thread in the main channel + spawn a read-only worker.
+    // New incident → open an investigation thread in the main channel.
     const repoName = evt.service ? this.deps.cfg.serviceRepoMap[evt.service] : undefined;
-    const repo = repoName ? this.deps.cfg.repos[repoName] : undefined;
+    const incId = 'inc-' + randomUUID().slice(0, 8);
 
-    if (this.workers.size >= this.deps.cfg.workerConcurrency) {
-      log.warn('alert not investigated — at capacity', { fp: evt.fingerprint, active: this.workers.size });
-      void this.deps.gateway.post({ text: `🚨 **${preview(evt.summary, 120)}** fired, but all ${this.deps.cfg.workerConcurrency} workers are busy — not investigating yet (will retry when it fires again).` });
+    // At investigation capacity: queue it (don't drop) — a queued incident still de-dups
+    // re-fires, and drains automatically when an investigation slot frees.
+    if (this.liveCount('investigation') >= this.deps.cfg.investigationConcurrency) {
+      const threadRootId = await this.deps.gateway.post({ text: this.investigationQueuedOpening(evt, repoName) });
+      this.deps.db.createIncident({ id: incId, fingerprint: evt.fingerprint, source, service: evt.service ?? null, repoName: repoName ?? null, threadRootId, workerId: null, summary: evt.summary, status: 'queued' });
+      this.investigationQueue.push({ evt, repoName, incidentId: incId, threadRootId });
+      void applyThreadStatus(this.deps.gateway, threadRootId, 'queued');
+      log.info('queued investigation (at capacity)', { incident: incId, active: this.liveCount('investigation'), cap: this.deps.cfg.investigationConcurrency, thread: threadRootId });
       return;
     }
 
     const threadRootId = await this.deps.gateway.post({ text: this.investigationOpening(evt, repoName) });
+    const workerId = await this.launchInvestigationWorker(evt, repoName, threadRootId);
+    this.deps.db.createIncident({ id: incId, fingerprint: evt.fingerprint, source, service: evt.service ?? null, repoName: repoName ?? null, threadRootId, workerId, summary: evt.summary });
+    log.info('opened investigation', { incident: incId, worker: workerId, repo: repoName ?? '(scratch)', thread: threadRootId });
+  }
+
+  /** Create and launch a read-only investigation worker (mapped repo, or a scratch dir). Returns its id. */
+  private async launchInvestigationWorker(evt: AlertEvent, repoName: string | undefined, threadRootId: string): Promise<string> {
+    const repo = repoName ? this.deps.cfg.repos[repoName] : undefined;
     const id = 'w-' + randomUUID().slice(0, 8);
     let repoPath: string;
     if (repo) {
@@ -259,9 +326,7 @@ export class Bridge {
     }
     const rec = this.deps.db.createWorker({ id, threadRootId, repoName: repoName ?? '(none)', repoPath, task: this.investigationTask(evt), kind: 'investigation' });
     this.launchWorker(rec);
-    const incId = 'inc-' + randomUUID().slice(0, 8);
-    this.deps.db.createIncident({ id: incId, fingerprint: evt.fingerprint, source, service: evt.service ?? null, repoName: repoName ?? null, threadRootId, workerId: id, summary: evt.summary });
-    log.info('opened investigation', { incident: incId, worker: id, repo: repoName ?? '(scratch)', thread: threadRootId });
+    return id;
   }
 
   private investigationOpening(evt: AlertEvent, repoName?: string): string {
@@ -269,6 +334,13 @@ export class Bridge {
     const where = repoName ? `repo **${repoName}**` : 'no mapped repo — read-only diagnosis in a scratch dir';
     const link = evt.sourceUrl ? `\n${evt.sourceUrl}` : '';
     return `🚨 **Investigating alert${sev}:** ${evt.summary}\nSource: ${evt.source} · ${where}${link}\n\nA worker is diagnosing (read-only). Reply here to steer it; \`/done\` to close.`;
+  }
+
+  private investigationQueuedOpening(evt: AlertEvent, repoName?: string): string {
+    const sev = evt.severity ? ` (${evt.severity})` : '';
+    const where = repoName ? `repo **${repoName}**` : 'no mapped repo — will diagnose in a scratch dir';
+    const link = evt.sourceUrl ? `\n${evt.sourceUrl}` : '';
+    return `🕒 **Queued alert${sev}:** ${evt.summary}\nSource: ${evt.source} · ${where}${link}\n\nAll ${this.deps.cfg.investigationConcurrency} investigation slots are busy — this will start automatically when one frees. \`/done\` to dismiss.`;
   }
 
   private investigationTask(evt: AlertEvent): string {

@@ -7,7 +7,7 @@ import { PendingQuestions } from './pending.js';
 import type { Gateway } from './mattermost.js';
 import type { Db } from './db.js';
 import type { Config } from './config.js';
-import type { WorkerRecord } from './types.js';
+import type { WorkerKind, WorkerRecord } from './types.js';
 
 export const WORKER_SYSTEM_PROMPT = `You are an autonomous engineering worker assigned to ONE feature in this repository.
 The human operator is NOT watching your terminal. The ONLY way to communicate with them is via your tools:
@@ -45,6 +45,7 @@ export class Worker {
   constructor(private deps: WorkerDeps) {}
 
   get id(): string { return this.deps.record.id; }
+  get kind(): WorkerKind { return this.deps.record.kind; }
 
   /**
    * Defense-in-depth for investigation workers: a PreToolUse hook that denies Bash

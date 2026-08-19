@@ -14,6 +14,7 @@ function fakeReactor(): Reactor & { added: [string, string][]; removed: [string,
 describe('STATUS_EMOJI', () => {
   it('maps each state to the agreed emoji', () => {
     expect(STATUS_EMOJI).toEqual({
+      queued: 'clock3',
       running: 'hourglass_flowing_sand',
       waiting: 'raised_hand',
       proposed: 'checkered_flag',

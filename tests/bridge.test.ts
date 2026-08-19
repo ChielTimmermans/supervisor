@@ -20,7 +20,7 @@ function fakeGateway(posts: any[], reactions: [string, string][] = []): Gateway 
 const cfg = {
   repos: { acme: { path: '/repo/acme', description: 'API' } },
   ingestChannels: [], serviceRepoMap: {}, incidentCooldownMs: 3_600_000,
-  workerConcurrency: 3, askUserTimeoutMs: 1000, attachmentDir: './scratch',
+  workerConcurrency: 3, investigationConcurrency: 2, askUserTimeoutMs: 1000, attachmentDir: './scratch',
   mattermost: { url: '', token: '', channelId: 'c' }, dbPath: ':memory:',
 } as Config;
 
@@ -141,6 +141,10 @@ describe('Bridge', () => {
     const c = { ...cfg, ingestChannels: [{ channelId: 'c-infra', source: 'prometheus' as const }] } as Config;
     return new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db, cfg: c });
   }
+  function ingestBridgeCap(posts: any[], sink: { pushed: string[] }, db: Db, invCap: number) {
+    const c = { ...cfg, ingestChannels: [{ channelId: 'c-infra', source: 'prometheus' as const }], investigationConcurrency: invCap } as Config;
+    return new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db, cfg: c });
+  }
   const fire = (msg: string) => post({ channelId: 'c-infra', rootId: '', message: msg });
 
   it('an ingest-channel alert opens an investigation and records an incident', async () => {
@@ -189,5 +193,78 @@ describe('Bridge', () => {
     await b.handlePost(post({ id: 'done', channelId: 'c', rootId: inc.threadRootId, message: '/done' }));
     expect(d.getIncident(inc.id)!.status).toBe('closed');
     expect(d.getWorker(inc.workerId!)!.status).toBe('finished');
+  });
+
+  it('queues a new investigation when the investigation pool is full, without dropping it', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridgeCap(p, s, d, 1); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] AlertA\nx'));
+    await b.handlePost(fire(':red_circle: [FIRING] AlertB\nx'));
+
+    expect(d.listWorkers().filter((w) => w.kind === 'investigation').length).toBe(1);
+    const incB = d.getOpenIncidentByFingerprint('prometheus:AlertB')!;
+    expect(incB.status).toBe('queued');
+    expect(incB.workerId).toBeNull();
+    expect(p.some((x) => /queued/i.test(x.text))).toBe(true);
+
+    // Feature pool is independent — a feature worker still spawns despite the full investigation pool.
+    expect((b as any).spawnWorker({ repo: 'acme', task: 'f', threadRootId: 'root-feat' }).ok).toBe(true);
+  });
+
+  it('drains a queued investigation when an investigation slot frees', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridgeCap(p, s, d, 1); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] AlertA\nx'));
+    await b.handlePost(fire(':red_circle: [FIRING] AlertB\nx'));
+    const incA = d.getOpenIncidentByFingerprint('prometheus:AlertA')!;
+
+    await b.handlePost(post({ id: 'doneA', channelId: 'c', rootId: incA.threadRootId, message: '/done' }));
+
+    await vi.waitFor(() => {
+      const incB = d.getOpenIncidentByFingerprint('prometheus:AlertB')!;
+      expect(incB.status).toBe('open');
+      expect(incB.workerId).toBeTruthy();
+    });
+  });
+
+  it('/done on a queued thread closes it and it never drains', async () => {
+    const p: any[] = []; const s = { pushed: [] as string[] }; const d = new Db(':memory:');
+    const b = ingestBridgeCap(p, s, d, 1); await b.start();
+    await b.handlePost(fire(':red_circle: [FIRING] AlertA\nx'));
+    await b.handlePost(fire(':red_circle: [FIRING] AlertB\nx'));
+    const incB = d.getOpenIncidentByFingerprint('prometheus:AlertB')!;
+
+    await b.handlePost(post({ id: 'doneB', channelId: 'c', rootId: incB.threadRootId, message: '/done' }));
+    expect(d.getIncident(incB.id)!.status).toBe('closed');
+
+    // Freeing A's slot must not resurrect the closed, de-queued incident.
+    const incA = d.getOpenIncidentByFingerprint('prometheus:AlertA')!;
+    await b.handlePost(post({ id: 'doneA', channelId: 'c', rootId: incA.threadRootId, message: '/done' }));
+    await new Promise((r) => setImmediate(r));
+    expect(d.getIncident(incB.id)!.status).toBe('closed');
+    expect(d.getIncident(incB.id)!.workerId).toBeNull();
+  });
+
+  it('/done closes a thread even when the worker is not live in memory', async () => {
+    const res = (bridge as any).spawnWorker({ repo: 'acme', task: 't', threadRootId: 'root-dead' });
+    (bridge as any).workers.delete(res.workerId); // simulate a worker that didn't re-attach
+    await bridge.handlePost(post({ id: 'dd', rootId: 'root-dead', message: '/done' }));
+    expect(db.getWorker(res.workerId)!.status).toBe('finished');
+  });
+
+  it('re-enqueues queued incidents on restart and drains them', async () => {
+    const d = new Db(':memory:');
+    d.createIncident({
+      id: 'iq', fingerprint: 'prometheus:Seed', source: 'prometheus', service: null,
+      repoName: null, threadRootId: 'root-q', workerId: null, summary: 'seed alert', status: 'queued',
+    });
+    const p: any[] = []; const s = { pushed: [] as string[] };
+    const b = ingestBridgeCap(p, s, d, 2); await b.start();
+
+    await vi.waitFor(() => {
+      const inc = d.getIncident('iq')!;
+      expect(inc.status).toBe('open');
+      expect(inc.workerId).toBeTruthy();
+    });
   });
 });
