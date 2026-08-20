@@ -94,7 +94,7 @@ export class Bridge {
 
     // Start / resume the supervisor.
     const toolServer = createSupervisorToolServer(this.supervisorDeps());
-    this.supervisor = new Supervisor({ queryFn: this.deps.queryFn, db: this.deps.db, cfg: this.deps.cfg, toolServer });
+    this.supervisor = new Supervisor({ queryFn: this.deps.queryFn, db: this.deps.db, cfg: this.deps.cfg, toolServer, gateway: this.deps.gateway });
     const active = this.deps.db.listWorkers().filter((w) => w.status === 'running' || w.status === 'waiting');
     this.supervisor.start(`You are online. Active workers: ${active.length ? active.map((w) => `${w.id}(${w.repoName})`).join(', ') : 'none'}.`);
     log.info('supervisor session started', { activeWorkers: active.length });

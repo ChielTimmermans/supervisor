@@ -5,10 +5,12 @@ import { Db } from './db.js';
 import { MattermostGateway } from './mattermost.js';
 import { Bridge } from './bridge.js';
 import { log } from './log.js';
+import { installCrashGuards } from './crashGuards.js';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 async function main() {
+  installCrashGuards();
   const cfg = loadConfig(process.env, process.env.REPOS_JSON ?? '{}');
   log.info('starting supervisor', {
     channel: cfg.mattermost.channelId,

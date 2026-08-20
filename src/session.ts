@@ -1,4 +1,6 @@
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { parseUsageLimit } from './usageLimit.js';
+import { log } from './log.js';
 
 export type QueryFn = typeof import('@anthropic-ai/claude-agent-sdk').query;
 
@@ -12,6 +14,12 @@ export interface SessionOptions {
   env?: Record<string, string>;
   resume?: string;
   hooks?: Record<string, unknown>;
+  // Resilience tuning + injectables (tests override wait/now to avoid real sleeps).
+  wait?: (ms: number) => Promise<void>;
+  now?: () => Date;
+  retryFloorMs?: number;   // never wait less than this on a limit
+  retryBackoffCapMs?: number; // cap for exponential backoff when no reset time is known
+  retryMaxMs?: number;     // absolute ceiling for any single wait (bounds a bad reset value)
 }
 
 // Minimal async queue: an async-iterable you can push to and close.
@@ -55,6 +63,8 @@ export class ClaudeSession {
     private opts: SessionOptions,
     private onSessionId?: (id: string) => void,
     private onError?: (err: unknown) => void,
+    private onPause?: (resetAt?: Date) => void,
+    private onResume?: () => void,
   ) {}
 
   get sessionId(): string | undefined { return this._sessionId; }
@@ -69,7 +79,7 @@ export class ClaudeSession {
   push(text: string): void { this.queue.push(userMessage(text)); }
   stop(): void { this.queue.close(); this.running = false; }
 
-  private async runLoop(): Promise<void> {
+  private buildOptions(): any {
     const options: any = {
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -79,23 +89,59 @@ export class ClaudeSession {
       allowedTools: this.opts.allowedTools,
       disallowedTools: this.opts.disallowedTools,
       env: this.opts.env,
-      resume: this.opts.resume,
+      // Resume the live session if we have one (recover after a usage-limit pause),
+      // otherwise fall back to the caller-provided resume id.
+      resume: this._sessionId ?? this.opts.resume,
       hooks: this.opts.hooks,
     };
     if (this.opts.systemPromptAppend) {
       options.systemPrompt = { type: 'preset', preset: 'claude_code', append: this.opts.systemPromptAppend };
     }
-    const stream = this.queryFn({ prompt: this.queue, options });
-    try {
-      for await (const msg of stream as AsyncIterable<any>) {
-        if (msg?.session_id && !this._sessionId) {
-          this._sessionId = msg.session_id;
-          this.onSessionId?.(msg.session_id);
+    return options;
+  }
+
+  private now(): Date { return this.opts.now ? this.opts.now() : new Date(); }
+  private wait(ms: number): Promise<void> {
+    return this.opts.wait ? this.opts.wait(ms) : new Promise((r) => setTimeout(r, ms));
+  }
+
+  /** How long to wait before retrying a usage-limited session. */
+  private retryDelay(resetAt: Date | null, attempt: number): number {
+    const floor = this.opts.retryFloorMs ?? 1_000;
+    const max = this.opts.retryMaxMs ?? 6 * 3_600_000; // 6h absolute ceiling
+    if (resetAt) {
+      const until = resetAt.getTime() - this.now().getTime() + 1_000; // small margin past the reset
+      return Math.min(max, Math.max(floor, until));
+    }
+    const cap = this.opts.retryBackoffCapMs ?? 300_000; // 5 min
+    return Math.min(cap, floor * 2 ** Math.max(0, attempt - 1));
+  }
+
+  private async runLoop(): Promise<void> {
+    let attempt = 0;
+    while (this.running) {
+      const stream = this.queryFn({ prompt: this.queue, options: this.buildOptions() });
+      try {
+        for await (const msg of stream as AsyncIterable<any>) {
+          if (msg?.session_id && !this._sessionId) {
+            this._sessionId = msg.session_id;
+            this.onSessionId?.(msg.session_id);
+          }
+          if (attempt > 0) { attempt = 0; this.onResume?.(); } // first message after a pause = recovered
         }
+        return; // stream drained normally (queue closed) — nothing more to do
+      } catch (err) {
+        const limit = this.running ? parseUsageLimit(err, this.now()) : null;
+        if (!limit) { this.running = false; this.onError?.(err); return; }
+        attempt++;
+        const delay = this.retryDelay(limit.resetAt, attempt);
+        log.warn('session hit usage limit; pausing', {
+          resetAt: limit.resetAt?.toISOString() ?? '(unknown)', delayMs: delay, attempt,
+        });
+        this.onPause?.(limit.resetAt ?? undefined);
+        await this.wait(delay);
+        // loop: re-establish the stream, resuming the same session id
       }
-    } catch (err) {
-      this.running = false;
-      this.onError?.(err);
     }
   }
 }

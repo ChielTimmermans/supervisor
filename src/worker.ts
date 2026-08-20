@@ -38,6 +38,8 @@ export interface WorkerDeps {
   cfg: Config;
   record: WorkerRecord;
   onFinish: () => void;
+  /** Test seam: override the usage-limit retry wait so tests don't sleep. */
+  wait?: (ms: number) => Promise<void>;
 }
 
 export class Worker {
@@ -73,25 +75,39 @@ export class Worker {
       gateway: this.deps.gateway, db: this.deps.db, pending: this.deps.pending,
       workerId: this.deps.record.id, threadRootId: this.deps.record.threadRootId,
     });
+    const { record, gateway } = this.deps;
     return new ClaudeSession(
       this.deps.queryFn,
       {
-        cwd: this.deps.record.repoPath,
-        systemPromptAppend: this.deps.record.kind === 'investigation' ? INVESTIGATION_SYSTEM_PROMPT : WORKER_SYSTEM_PROMPT,
+        cwd: record.repoPath,
+        systemPromptAppend: record.kind === 'investigation' ? INVESTIGATION_SYSTEM_PROMPT : WORKER_SYSTEM_PROMPT,
         model: this.deps.cfg.model,
         mcpServers: { worker: server },
         allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', ...toolNames],
         env: { ...process.env as Record<string, string>, MCP_TIMEOUT: String(this.deps.cfg.askUserTimeoutMs) },
         resume,
         hooks: this.clusterWriteGuardHooks(),
+        wait: this.deps.wait,
       },
-      (id) => { log.debug('worker session id', { worker: this.deps.record.id, session: id }); this.deps.db.updateWorker(this.deps.record.id, { sessionId: id }); },
+      (id) => { log.debug('worker session id', { worker: record.id, session: id }); this.deps.db.updateWorker(record.id, { sessionId: id }); },
       (err) => {
-        log.error('worker session error', { worker: this.deps.record.id, err: err instanceof Error ? err.message : String(err) });
-        this.deps.db.updateWorker(this.deps.record.id, { status: 'failed' });
-        void this.deps.gateway.post({ text: `Worker hit a fatal session error: ${err instanceof Error ? err.message : String(err)}`, threadRootId: this.deps.record.threadRootId });
-        void applyThreadStatus(this.deps.gateway, this.deps.record.threadRootId, 'failed');
+        log.error('worker session error', { worker: record.id, err: err instanceof Error ? err.message : String(err) });
+        this.deps.db.updateWorker(record.id, { status: 'failed' });
+        void gateway.post({ text: `Worker hit a fatal session error: ${err instanceof Error ? err.message : String(err)}`, threadRootId: record.threadRootId });
+        void applyThreadStatus(gateway, record.threadRootId, 'failed');
         this.deps.onFinish();
+      },
+      // Usage/rate limit: the session pauses and auto-resumes — not a failure.
+      (resetAt) => {
+        const when = resetAt ? ` resuming ~${resetAt.toISOString().slice(11, 16)} UTC` : ' will retry shortly';
+        log.warn('worker paused on usage limit', { worker: record.id, resetAt: resetAt?.toISOString() ?? '(unknown)' });
+        void gateway.post({ text: `⏳ Paused — hit the usage limit,${when}.`, threadRootId: record.threadRootId });
+        void applyThreadStatus(gateway, record.threadRootId, 'waiting');
+      },
+      () => {
+        log.info('worker resumed after usage limit', { worker: record.id });
+        void gateway.post({ text: '▶️ Resumed — usage available again.', threadRootId: record.threadRootId });
+        void applyThreadStatus(gateway, record.threadRootId, 'running');
       },
     );
   }
