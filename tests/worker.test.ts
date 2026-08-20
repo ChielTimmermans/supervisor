@@ -92,6 +92,27 @@ describe('Worker', () => {
     expect(seenOptions[0].hooks).toBeUndefined();
   });
 
+  it('posts a pause notice on a usage limit and a resume notice on recovery', async () => {
+    const posts: { text: string; threadRootId?: string }[] = [];
+    const gateway: Gateway = { ...fakeGateway(), post: async (a) => { posts.push(a); return 'p'; } };
+    const reset = Math.floor(new Date('2026-08-20T15:00:00Z').getTime() / 1000);
+    let calls = 0;
+    const queryFn = ((args: any) => (async function* () {
+      calls++;
+      if (calls === 1) throw new Error(`Claude AI usage limit reached|${reset}`);
+      yield { type: 'system', session_id: 'ws-1' };
+      for await (const _m of args.prompt) { /* drain */ }
+    })()) as any;
+
+    const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'a', repoPath: '/a', task: 'x' });
+    const w = new Worker({ queryFn, gateway, db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {}, wait: () => Promise.resolve() });
+    w.start();
+
+    await vi.waitFor(() => expect(posts.some((p) => p.threadRootId === 't1' && /paused/i.test(p.text) && /usage limit/i.test(p.text))).toBe(true));
+    await vi.waitFor(() => expect(posts.some((p) => p.threadRootId === 't1' && /resumed/i.test(p.text))).toBe(true));
+    expect(db.getWorker('w1')!.status).not.toBe('failed'); // a limit is not a failure
+  });
+
   it('inject appends attachment paths to the pushed message', async () => {
     const received: string[] = [];
     const queryFn = ((args: any) => (async function* () {

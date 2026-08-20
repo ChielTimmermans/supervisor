@@ -1,6 +1,26 @@
+import { appendFileSync, statSync, renameSync } from 'node:fs';
+
 export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
 
 const RANK: Record<LogLevel, number> = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
+
+const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10 MB before rotating to <file>.1
+
+/**
+ * Append a line to LOG_FILE (if set) so a crash can't take the logs with it.
+ * Synchronous on purpose: the line is on disk before control returns, so an
+ * uncaughtException handler's final log survives. Never throws — a logging
+ * failure must not crash the process.
+ */
+function writeToFile(line: string): void {
+  const file = process.env.LOG_FILE;
+  if (!file) return;
+  try {
+    const max = Number(process.env.LOG_MAX_BYTES) || DEFAULT_MAX_BYTES;
+    try { if (statSync(file).size >= max) renameSync(file, file + '.1'); } catch { /* no file yet */ }
+    appendFileSync(file, line + '\n');
+  } catch { /* disk full, bad path, permissions — never let logging crash us */ }
+}
 
 // Read the threshold per call so it picks up LOG_LEVEL after dotenv loads,
 // regardless of module init order. Defaults to `info`, or `silent` under tests.
@@ -29,8 +49,10 @@ function emit(level: Exclude<LogLevel, 'silent'>, msg: string, ctx?: Record<stri
   const suffix = ctx && Object.keys(ctx).length
     ? ' ' + Object.entries(ctx).map(([k, v]) => `${k}=${fmt(v)}`).join(' ')
     : '';
+  const line = `${time} ${tag} ${msg}${suffix}`;
   const write = level === 'error' || level === 'warn' ? console.error : console.log;
-  write(`${time} ${tag} ${msg}${suffix}`);
+  write(line);
+  writeToFile(line);
 }
 
 export const log = {

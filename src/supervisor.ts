@@ -2,6 +2,7 @@ import { ClaudeSession, type QueryFn } from './session.js';
 import { log } from './log.js';
 import type { Db } from './db.js';
 import type { Config } from './config.js';
+import type { Gateway } from './mattermost.js';
 
 export function supervisorSystemPrompt(cfg: Config): string {
   const repos = Object.entries(cfg.repos).map(([n, r]) => `- ${n}: ${r.description}`).join('\n');
@@ -20,6 +21,9 @@ export interface SupervisorDeps {
   db: Db;
   cfg: Config;
   toolServer: { server: unknown; toolNames: string[] };
+  gateway: Gateway;
+  /** Test seam: override the usage-limit retry wait so tests don't sleep. */
+  wait?: (ms: number) => Promise<void>;
 }
 
 export class Supervisor {
@@ -34,9 +38,20 @@ export class Supervisor {
         allowedTools: deps.toolServer.toolNames,
         disallowedTools: ['Bash', 'Write', 'Edit'],
         resume: deps.db.getMeta('supervisor_session') ?? undefined,
+        wait: deps.wait,
       },
       (id) => { log.debug('supervisor session id', { session: id }); deps.db.setMeta('supervisor_session', id); },
       (err) => log.error('supervisor session error', { err: err instanceof Error ? err.message : String(err) }),
+      // Usage/rate limit: the supervisor pauses and auto-resumes — it must never go permanently deaf.
+      (resetAt) => {
+        const when = resetAt ? ` resuming ~${resetAt.toISOString().slice(11, 16)} UTC` : ' will retry shortly';
+        log.warn('supervisor paused on usage limit', { resetAt: resetAt?.toISOString() ?? '(unknown)' });
+        void deps.gateway.post({ text: `⏳ Supervisor paused — hit the usage limit,${when}. Alerts and messages will be handled once usage returns.` });
+      },
+      () => {
+        log.info('supervisor resumed after usage limit');
+        void deps.gateway.post({ text: '▶️ Supervisor resumed — usage available again.' });
+      },
     );
   }
   start(seed: string): void { this.session.start(seed); }
