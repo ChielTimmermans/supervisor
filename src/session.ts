@@ -58,6 +58,8 @@ export class ClaudeSession {
   private queue = new MessageQueue<SDKUserMessage>();
   private _sessionId?: string;
   private running = false;
+  private stopped = false;
+  private aborter = new AbortController();
   constructor(
     private queryFn: QueryFn,
     private opts: SessionOptions,
@@ -77,7 +79,8 @@ export class ClaudeSession {
   }
 
   push(text: string): void { this.queue.push(userMessage(text)); }
-  stop(): void { this.queue.close(); this.running = false; }
+  /** Stop the session. Aborts any in-flight turn so a hung worker is actually broken, not just left running. */
+  stop(): void { this.stopped = true; this.queue.close(); this.running = false; this.aborter.abort(); }
 
   private buildOptions(): any {
     const options: any = {
@@ -93,6 +96,7 @@ export class ClaudeSession {
       // otherwise fall back to the caller-provided resume id.
       resume: this._sessionId ?? this.opts.resume,
       hooks: this.opts.hooks,
+      abortController: this.aborter,
     };
     if (this.opts.systemPromptAppend) {
       options.systemPrompt = { type: 'preset', preset: 'claude_code', append: this.opts.systemPromptAppend };
@@ -131,6 +135,7 @@ export class ClaudeSession {
         }
         return; // stream drained normally (queue closed) — nothing more to do
       } catch (err) {
+        if (this.stopped) return; // intentional stop()/abort — not a failure to report
         const limit = this.running ? parseUsageLimit(err, this.now()) : null;
         if (!limit) { this.running = false; this.onError?.(err); return; }
         attempt++;

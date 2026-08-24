@@ -4,6 +4,7 @@ import path from 'node:path';
 import { route } from './router.js';
 import { parseAlert } from './alerts.js';
 import { PendingQuestions } from './pending.js';
+import { DevEnvLocks } from './devEnvLocks.js';
 import { Worker } from './worker.js';
 import { Supervisor } from './supervisor.js';
 import { createSupervisorToolServer, type SupervisorToolDeps } from './tools/supervisorTools.js';
@@ -21,6 +22,7 @@ export interface BridgeDeps { queryFn: QueryFn; gateway: Gateway; db: Db; cfg: C
 
 export class Bridge {
   private pending: PendingQuestions;
+  private devLocks: DevEnvLocks;
   private workers = new Map<string, Worker>();
   private ingest: Map<string, AlertSource>;
   private supervisor!: Supervisor;
@@ -53,6 +55,7 @@ export class Bridge {
   }
   constructor(private deps: BridgeDeps) {
     this.pending = new PendingQuestions(deps.db);
+    this.devLocks = new DevEnvLocks(deps.db, { ttlMs: deps.cfg.devClaimTtlMs, waitTimeoutMs: deps.cfg.devClaimWaitTimeoutMs });
     this.ingest = new Map(deps.cfg.ingestChannels.map((c) => [c.channelId, c.source]));
   }
 
@@ -71,7 +74,7 @@ export class Bridge {
       if (!rec.sessionId) { this.markFailed(rec.id, 'No session to resume.'); continue; }
       const worker = new Worker({
         queryFn: this.deps.queryFn, gateway: this.deps.gateway, db: this.deps.db,
-        pending: this.pending, cfg: this.deps.cfg, record: rec,
+        pending: this.pending, cfg: this.deps.cfg, devLocks: this.devLocks, record: rec,
         onFinish: () => this.onWorkerFinished(rec.id),
       });
       try {
@@ -91,6 +94,10 @@ export class Bridge {
       }
       catch { this.markFailed(rec.id, 'Could not resume session.'); }
     }
+
+    // Drop any persisted dev-env claims whose holder didn't come back live (crashed mid-hold),
+    // so a restart can't leave the env wedged. Live resumed holders keep their claim.
+    this.devLocks.reconcile((id) => this.workers.has(id));
 
     // Start / resume the supervisor.
     const toolServer = createSupervisorToolServer(this.supervisorDeps());
@@ -112,6 +119,7 @@ export class Bridge {
   private onWorkerFinished(id: string): void {
     const w = this.workers.get(id);
     this.workers.delete(id);
+    this.devLocks.releaseAllFor(id); // never let a gone worker keep the dev env
     if (w) setImmediate(() => w.stop());
     void this.drainQueue(); // a freed slot may let a queued investigation start
   }
@@ -146,7 +154,7 @@ export class Bridge {
   private launchWorker(rec: WorkerRecord): void {
     const worker = new Worker({
       queryFn: this.deps.queryFn, gateway: this.deps.gateway, db: this.deps.db,
-      pending: this.pending, cfg: this.deps.cfg, record: rec,
+      pending: this.pending, cfg: this.deps.cfg, devLocks: this.devLocks, record: rec,
       onFinish: () => this.onWorkerFinished(rec.id),
     });
     worker.start();
@@ -157,6 +165,7 @@ export class Bridge {
   private stopWorker(id: string): void {
     this.workers.get(id)?.stop();
     this.workers.delete(id);
+    this.devLocks.releaseAllFor(id);
     this.deps.db.updateWorker(id, { status: 'finished' });
     log.info('stopped worker', { worker: id });
   }
@@ -166,6 +175,7 @@ export class Bridge {
     const rec = this.deps.db.getWorker(id);
     this.workers.get(id)?.stop();
     this.workers.delete(id);
+    this.devLocks.releaseAllFor(id);
     this.deps.db.updateWorker(id, { status: 'finished' });
     this.pending.cancel(id);
     if (rec) {
@@ -187,8 +197,40 @@ export class Bridge {
     log.info('closed queued incident (operator /done)', { incident: inc.id });
   }
 
+  /** Operator `/release`: break the dev-env hold this worker has, hand off, but keep it running. */
+  private releaseWorkerClaim(w: WorkerRecord): void {
+    const holder = this.devLocks.holderOf(w.repoName);
+    if (!holder || holder.workerId !== w.id) {
+      void this.deps.gateway.post({ text: `This worker isn't holding the ${w.repoName} dev environment.`, threadRootId: w.threadRootId });
+      return;
+    }
+    const res = this.devLocks.forceRelease(w.repoName);
+    void this.deps.gateway.post({
+      text: `🔓 Freed the **${w.repoName}** dev environment${res.promoted ? ' and handed it to a waiting worker' : ''}. This worker keeps running — it will re-claim with claim_dev if it still needs the env.`,
+      threadRootId: w.threadRootId,
+    });
+    log.info('operator released dev claim', { worker: w.id, repo: w.repoName, handedOff: !!res.promoted });
+  }
+
+  /** Operator `/kill`: force-stop a stuck worker — aborts its in-flight turn and frees its claim. */
+  private killWorker(id: string): void {
+    const rec = this.deps.db.getWorker(id);
+    this.workers.get(id)?.stop(); // aborts any hung in-flight turn
+    this.workers.delete(id);
+    this.devLocks.releaseAllFor(id);
+    this.pending.cancel(id);
+    this.deps.db.updateWorker(id, { status: 'failed' });
+    if (rec) {
+      void this.deps.gateway.post({ text: '🛑 Force-stopped this worker (it appeared stuck) and freed any dev environment it held. Send a new message to start fresh, or `/done` to close the thread.', threadRootId: rec.threadRootId });
+      void applyThreadStatus(this.deps.gateway, rec.threadRootId, 'failed');
+    }
+    log.warn('killed worker (operator /kill)', { worker: id });
+    void this.drainQueue();
+  }
+
   private markFailed(id: string, reason: string): void {
     log.warn('worker failed', { worker: id, reason });
+    this.devLocks.releaseAllFor(id);
     this.deps.db.updateWorker(id, { status: 'failed' });
     const rec = this.deps.db.getWorker(id);
     if (rec) {
@@ -230,6 +272,22 @@ export class Bridge {
       if (w) { this.closeWorker(w.id); return; }
       const inc = this.deps.db.getIncidentByThread(post.rootId);
       if (inc && inc.status !== 'closed') { this.closeIncidentThread(inc); return; }
+    }
+
+    // Free the dev environment this thread's worker is holding, without closing the feature.
+    if (post.rootId !== '' && cmd === '/release') {
+      const w = this.deps.db.getWorkerByThread(post.rootId);
+      if (w) this.releaseWorkerClaim(w);
+      else void this.deps.gateway.post({ text: 'No worker in this thread to release a dev environment for.', threadRootId: post.rootId });
+      return;
+    }
+
+    // Force-stop a stuck worker: abort its in-flight turn and free anything it holds.
+    if (post.rootId !== '' && (cmd === '/kill' || cmd === '/stop')) {
+      const w = this.deps.db.getWorkerByThread(post.rootId);
+      if (w && (w.status === 'running' || w.status === 'waiting')) this.killWorker(w.id);
+      else void this.deps.gateway.post({ text: 'No active worker in this thread to stop.', threadRootId: post.rootId });
+      return;
     }
 
     const files = post.fileIds.length ? await this.downloadAttachments(post) : [];

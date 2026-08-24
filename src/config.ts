@@ -14,6 +14,10 @@ export interface Config {
   attachmentDir: string;
   dbPath: string;
   model?: string;
+  /** How long a dev-env claim may be held before another worker may break it as stale. */
+  devClaimTtlMs: number;
+  /** How long a worker waits for a busy dev env before giving up and returning control. */
+  devClaimWaitTimeoutMs: number;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -40,5 +44,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, reposJson: string): Config {
     attachmentDir: env.ATTACHMENT_DIR ?? './scratch/attachments',
     dbPath: env.DB_PATH ?? './data/supervisor.sqlite',
     model: env.MODEL,
+    devClaimTtlMs: env.DEV_CLAIM_TTL_MS ? Number(env.DEV_CLAIM_TTL_MS) : 1_800_000, // 30 min
+    devClaimWaitTimeoutMs: env.DEV_CLAIM_WAIT_TIMEOUT_MS ? Number(env.DEV_CLAIM_WAIT_TIMEOUT_MS) : 900_000, // 15 min
   };
 }

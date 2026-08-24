@@ -4,6 +4,7 @@ import { inspectBashCommand } from './guard.js';
 import { applyThreadStatus } from './threadStatus.js';
 import { log } from './log.js';
 import { PendingQuestions } from './pending.js';
+import type { DevEnvLocks } from './devEnvLocks.js';
 import type { Gateway } from './mattermost.js';
 import type { Db } from './db.js';
 import type { Config } from './config.js';
@@ -15,6 +16,7 @@ The human operator is NOT watching your terminal. The ONLY way to communicate wi
 - send_update: post progress or share an artifact (spec, plan, diff) as an attachment.
 - finish: PROPOSE that the feature is complete and post a summary. This does NOT end the work.
 Work autonomously. Decide for yourself when you need the operator.
+This repository has a SHARED dev environment that only one worker may use at a time. Before you do anything that touches it — starting the dev server, running migrations or seeds, deploying to dev, or running tests that hit the dev environment — call claim_dev. If another worker holds it, claim_dev waits and returns once it's free; that's expected, not an error. Call release_dev the moment you no longer need it so others aren't blocked. Purely local work (reading code, editing files, unit tests that don't touch dev) does NOT need a claim.
 Completion is the operator's call, not yours. When you believe the feature is done, call finish to propose it, then stop and wait. The operator will either reply with more changes (address them and call finish again) or close the thread with /done. Never treat yourself as finished until the operator closes the thread.`;
 
 export const INVESTIGATION_SYSTEM_PROMPT = `You are an autonomous engineering worker investigating a production alert. The human operator is NOT watching your terminal; communicate ONLY via your tools (ask_user, send_update, finish).
@@ -36,6 +38,7 @@ export interface WorkerDeps {
   db: Db;
   pending: PendingQuestions;
   cfg: Config;
+  devLocks: DevEnvLocks;
   record: WorkerRecord;
   onFinish: () => void;
   /** Test seam: override the usage-limit retry wait so tests don't sleep. */
@@ -74,6 +77,7 @@ export class Worker {
     const { server, toolNames } = createWorkerToolServer({
       gateway: this.deps.gateway, db: this.deps.db, pending: this.deps.pending,
       workerId: this.deps.record.id, threadRootId: this.deps.record.threadRootId,
+      repoName: this.deps.record.repoName, kind: this.deps.record.kind, devLocks: this.deps.devLocks,
     });
     const { record, gateway } = this.deps;
     return new ClaudeSession(

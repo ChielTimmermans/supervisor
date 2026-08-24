@@ -26,6 +26,7 @@ const cfg = {
   ingestChannels: [], serviceRepoMap: {}, incidentCooldownMs: 3_600_000,
   workerConcurrency: 3, investigationConcurrency: 2, askUserTimeoutMs: 1000, attachmentDir: './scratch',
   mattermost: { url: '', token: '', channelId: 'c' }, dbPath: ':memory:',
+  devClaimTtlMs: 1_800_000, devClaimWaitTimeoutMs: 900_000,
 } as Config;
 const post = (o: Partial<IncomingPost>): IncomingPost => ({ id: 'p', channelId: 'c', rootId: '', message: 'm', userId: 'u', fileIds: [], isOwn: false, ...o });
 
@@ -46,7 +47,7 @@ describe('end-to-end feature flow', () => {
     expect(spawn.ok).toBe(true);
     const worker = db.getWorkerByThread('root1')!;
     const pending = (bridge as any).pending;
-    const deps = { gateway: (bridge as any).deps.gateway, db, pending, workerId: worker.id, threadRootId: 'root1' };
+    const deps = { gateway: (bridge as any).deps.gateway, db, pending, workerId: worker.id, threadRootId: 'root1', repoName: worker.repoName, kind: 'feature' as const, devLocks: (bridge as any).devLocks };
 
     // 3. Worker asks a question (blocks).
     const asked = askUserHandler(deps, { question: 'Which file?' });

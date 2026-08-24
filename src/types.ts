@@ -47,6 +47,14 @@ export interface IncomingPost {
   isOwn: boolean;      // authored by the bot itself
 }
 
+/** An exclusive hold on a repo's shared dev environment, held by one worker at a time. */
+export interface DevClaim {
+  repoName: string;
+  workerId: string;
+  threadRootId: string;
+  claimedAt: number;
+}
+
 export interface WorkerRecord {
   id: string;
   threadRootId: string;

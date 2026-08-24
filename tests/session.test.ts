@@ -85,6 +85,30 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('stop() aborts a hung turn and does not report it as an error', async () => {
+    // A query that hangs until its abort signal fires (a stuck worker).
+    let sawAbort = false;
+    const hangingQuery = ((args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      const signal = args.options?.abortController?.signal as AbortSignal | undefined;
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) { sawAbort = true; return resolve(); }
+        signal?.addEventListener('abort', () => { sawAbort = true; resolve(); });
+      });
+      throw new Error('aborted'); // SDK surfaces an abort as a throw
+    })()) as any;
+
+    let errored: unknown;
+    const s = new ClaudeSession(hangingQuery, {}, () => {}, (e) => { errored = e; });
+    s.start('do a long thing');
+    await vi.waitFor(() => expect(s.sessionId).toBe('sess-1'));
+    s.stop();
+    await vi.waitFor(() => expect(sawAbort).toBe(true));
+    // give the loop a tick to run its catch
+    await new Promise((r) => setTimeout(r, 0));
+    expect(errored).toBeUndefined();
+  });
+
   it('pauses with an undefined reset when the limit carries no time (backoff)', async () => {
     const received: string[] = [];
     const pauses: (Date | undefined)[] = [];
