@@ -146,10 +146,22 @@ export class ClaudeSession {
 
   private async runLoop(): Promise<void> {
     let attempt = 0;
+    let connectCount = 0;
     while (this.running) {
+      connectCount++;
+      const isReconnect = connectCount > 1;
+      const connectStartedAt = Date.now();
+      log.debug('session connecting', { sessionId: this._sessionId, connectCount, isReconnect });
       const stream = this.queryFn({ prompt: this.queue, options: this.buildOptions() });
+      let gotFirstMessage = false;
       try {
         for await (const msg of stream as AsyncIterable<any>) {
+          if (!gotFirstMessage) {
+            gotFirstMessage = true;
+            log.debug('session first message on connection', {
+              sessionId: this._sessionId, connectCount, isReconnect, waitedMs: Date.now() - connectStartedAt,
+            });
+          }
           if (msg?.session_id && !this._sessionId) {
             this._sessionId = msg.session_id;
             this.onSessionId?.(msg.session_id);
@@ -163,6 +175,10 @@ export class ClaudeSession {
         // this.queue is the one persistent conduit push() writes to for the
         // life of the session, and once nothing is consuming it, every later
         // push() (an operator follow-up) silently vanishes with no error.
+        log.warn('session stream drained', {
+          sessionId: this._sessionId, connectCount, gotFirstMessage,
+          connectedForMs: Date.now() - connectStartedAt, running: this.running, queuePending: this.queue.pending,
+        });
         //
         // If stop() already flipped `running` false, we really are done.
         if (!this.running) return;
@@ -173,7 +189,12 @@ export class ClaudeSession {
         // `continue` — is what keeps this from becoming a reconnect storm if
         // the SDK keeps ending the stream instantly for this session: we only
         // ever pay for a fresh queryFn() call in response to actual new work.
-        if (!this.queue.pending) await this.waitForWork();
+        if (!this.queue.pending) {
+          const parkedAt = Date.now();
+          log.debug('session parking, waiting for next push()', { sessionId: this._sessionId, connectCount });
+          await this.waitForWork();
+          log.debug('session woke from park', { sessionId: this._sessionId, connectCount, parkedMs: Date.now() - parkedAt });
+        }
         // loop: re-establish the stream (same queue instance, same session id)
       } catch (err) {
         if (this.stopped) return; // intentional stop()/abort — not a failure to report
