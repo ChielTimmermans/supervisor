@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import path from 'node:path';
 import { normalizeIncomingPost, threadRootOf, MattermostGateway } from '../src/mattermost.js';
+import { Db } from '../src/db.js';
 
 describe('mattermost helpers', () => {
   it('threadRootOf returns root_id when present, else id', () => {
@@ -116,5 +117,126 @@ describe('MattermostGateway.downloadFile', () => {
 
     expect(fetchedUrl).toBe('https://chat.example.com/api/v4/files/fid123');
     expect(fetchedUrl).not.toContain('.comhttps');
+  });
+});
+
+describe('MattermostGateway websocket catch-up', () => {
+  function fakeWs() {
+    return {
+      firstConnect: [] as Array<() => void>,
+      reconnect: [] as Array<() => void>,
+      missed: [] as Array<() => void>,
+      closeCbs: [] as Array<(c: number) => void>,
+      error: [] as Array<(e: unknown) => void>,
+      message: [] as Array<(m: any) => void>,
+      initialized: null as null | { url: string; token: string },
+      addFirstConnectListener(cb: () => void) { this.firstConnect.push(cb); },
+      addReconnectListener(cb: () => void) { this.reconnect.push(cb); },
+      addMissedMessageListener(cb: () => void) { this.missed.push(cb); },
+      addCloseListener(cb: (c: number) => void) { this.closeCbs.push(cb); },
+      addErrorListener(cb: (e: unknown) => void) { this.error.push(cb); },
+      addMessageListener(cb: (m: any) => void) { this.message.push(cb); },
+      initialize(url: string, token: string) { this.initialized = { url, token }; },
+      close() { /* noop */ },
+    };
+  }
+
+  type RawPostFixture = { id: string; create_at: number; user_id?: string; channel_id?: string; root_id?: string; message?: string; delete_at?: number };
+
+  function postListOf(posts: RawPostFixture[]): any {
+    const full = posts.map((p) => ({ channel_id: 'main', user_id: 'u1', root_id: '', message: 'm', delete_at: 0, ...p }));
+    return {
+      order: full.map((p) => p.id),
+      posts: Object.fromEntries(full.map((p) => [p.id, p])),
+      next_post_id: '', prev_post_id: '', first_inaccessible_post_time: 0,
+    };
+  }
+
+  it('on first-ever connect with no persisted cursor, baselines to now without fetching (bounded — no unbounded backfill)', async () => {
+    const ws = fakeWs();
+    const db = new Db(':memory:');
+    const gw = new MattermostGateway({ url: 'https://chat.example.com', token: 't', channelId: 'main' }, [], () => ws as any, db);
+    const spy = vi.spyOn((gw as any).client, 'getPostsSince');
+    const received: string[] = [];
+    (gw as any).buildSocket((p: { id: string }) => received.push(p.id));
+
+    ws.firstConnect[0]();
+    await vi.waitFor(() => expect(db.getChannelCursor('main')).toBeTruthy());
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(received).toEqual([]);
+  });
+
+  it('on reconnect, fetches and processes posts missed while disconnected', async () => {
+    const ws = fakeWs();
+    const db = new Db(':memory:');
+    db.setChannelCursor('main', { postId: 'p0', createAt: 1000 }); // as if p0 was processed before the drop
+    const gw = new MattermostGateway({ url: 'https://chat.example.com', token: 't', channelId: 'main' }, [], () => ws as any, db);
+    (gw as any).botId = 'bot';
+    vi.spyOn((gw as any).client, 'getPostsSince').mockResolvedValue(postListOf([
+      { id: 'p1', create_at: 1100, user_id: 'u1' },
+      { id: 'p2', create_at: 1200, user_id: 'u1' },
+    ]));
+    const received: string[] = [];
+    (gw as any).buildSocket((p: { id: string }) => received.push(p.id));
+
+    ws.reconnect[0]();
+    await vi.waitFor(() => expect(received).toEqual(['p1', 'p2']));
+    expect(db.getChannelCursor('main')).toEqual({ postId: 'p2', createAt: 1200 });
+  });
+
+  it('does not replay already-processed posts on a normal clean reconnect', async () => {
+    const ws = fakeWs();
+    const db = new Db(':memory:');
+    db.setChannelCursor('main', { postId: 'p2', createAt: 1200 });
+    const gw = new MattermostGateway({ url: 'https://chat.example.com', token: 't', channelId: 'main' }, [], () => ws as any, db);
+    (gw as any).botId = 'bot';
+    const spy = vi.spyOn((gw as any).client, 'getPostsSince').mockResolvedValue(postListOf([])); // nothing new server-side
+    const received: string[] = [];
+    (gw as any).buildSocket((p: { id: string }) => received.push(p.id));
+
+    ws.reconnect[0]();
+    await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+    expect(received).toEqual([]);
+    expect(db.getChannelCursor('main')).toEqual({ postId: 'p2', createAt: 1200 }); // unchanged
+  });
+
+  it('a post delivered live and then re-seen via an overlapping catch-up is only processed once', async () => {
+    const ws = fakeWs();
+    const db = new Db(':memory:');
+    db.setChannelCursor('main', { postId: 'p0', createAt: 1000 });
+    const gw = new MattermostGateway({ url: 'https://chat.example.com', token: 't', channelId: 'main' }, [], () => ws as any, db);
+    (gw as any).botId = 'bot';
+    const received: string[] = [];
+    (gw as any).buildSocket((p: { id: string }) => received.push(p.id));
+    const handler = ws.message[0];
+
+    // Live delivery of p1 via the websocket.
+    handler({
+      event: 'posted', broadcast: { channel_id: 'main' },
+      data: { post: JSON.stringify({ id: 'p1', channel_id: 'main', user_id: 'u1', root_id: '', message: 'm', create_at: 1100, delete_at: 0 }) },
+    });
+
+    // A reconnect fires moments later and its catch-up also returns p1 (race).
+    const spy = vi.spyOn((gw as any).client, 'getPostsSince').mockResolvedValue(postListOf([{ id: 'p1', create_at: 1100, user_id: 'u1' }]));
+    ws.reconnect[0]();
+    await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+
+    expect(received).toEqual(['p1']); // not delivered twice
+  });
+
+  it("does not reprocess the bot's own historical posts, but still advances the cursor past them", async () => {
+    const ws = fakeWs();
+    const db = new Db(':memory:');
+    db.setChannelCursor('main', { postId: 'p0', createAt: 1000 });
+    const gw = new MattermostGateway({ url: 'https://chat.example.com', token: 't', channelId: 'main' }, [], () => ws as any, db);
+    (gw as any).botId = 'bot';
+    vi.spyOn((gw as any).client, 'getPostsSince').mockResolvedValue(postListOf([{ id: 'p1', create_at: 1100, user_id: 'bot' }]));
+    const received: string[] = [];
+    (gw as any).buildSocket((p: { id: string }) => received.push(p.id));
+
+    ws.reconnect[0]();
+    await vi.waitFor(() => expect(db.getChannelCursor('main')).toEqual({ postId: 'p1', createAt: 1100 }));
+    expect(received).toEqual([]); // own post filtered, per existing isOwn behavior
   });
 });

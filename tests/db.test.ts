@@ -5,6 +5,15 @@ let db: Db;
 beforeEach(() => { db = new Db(':memory:'); });
 
 describe('Db', () => {
+  it('persists and reads back a per-channel websocket catch-up cursor', () => {
+    expect(db.getChannelCursor('c1')).toBeUndefined();
+    db.setChannelCursor('c1', { postId: 'p1', createAt: 1000 });
+    expect(db.getChannelCursor('c1')).toEqual({ postId: 'p1', createAt: 1000 });
+    db.setChannelCursor('c1', { postId: 'p2', createAt: 2000 });
+    expect(db.getChannelCursor('c1')).toEqual({ postId: 'p2', createAt: 2000 }); // overwrites
+    expect(db.getChannelCursor('c2')).toBeUndefined(); // independent per channel
+  });
+
   it('creates and reads a worker by id and thread', () => {
     const w = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'acme', repoPath: '/r/acme', task: 'do x' });
     expect(w.status).toBe('running');

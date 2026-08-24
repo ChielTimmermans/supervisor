@@ -20,7 +20,7 @@ async function main() {
   });
   await mkdir(path.dirname(cfg.dbPath), { recursive: true });
   const db = new Db(cfg.dbPath);
-  const gateway = new MattermostGateway(cfg.mattermost, cfg.ingestChannels.map((c) => c.channelId));
+  const gateway = new MattermostGateway(cfg.mattermost, cfg.ingestChannels.map((c) => c.channelId), undefined, db);
   const bridge = new Bridge({ queryFn: query, gateway, db, cfg });
   await bridge.start();
   log.info('bridge online');

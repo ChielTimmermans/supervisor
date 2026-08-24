@@ -55,6 +55,14 @@ export interface DevClaim {
   claimedAt: number;
 }
 
+/** Per-channel bookmark of the last websocket post we've durably processed. Used by
+ *  MattermostGateway's REST catch-up to backfill posts that arrived while the websocket
+ *  was disconnected (reconnect storms, process restarts), without replaying full history. */
+export interface ChannelCursor {
+  postId: string;
+  createAt: number;
+}
+
 export interface WorkerRecord {
   id: string;
   threadRootId: string;

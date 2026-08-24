@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import type { WorkerRecord, WorkerStatus, WorkerKind, IncidentRecord, IncidentStatus, AlertSource, DevClaim } from './types.js';
+import type { WorkerRecord, WorkerStatus, WorkerKind, IncidentRecord, IncidentStatus, AlertSource, DevClaim, ChannelCursor } from './types.js';
 
 export class Db {
   private db: Database.Database;
@@ -124,6 +124,21 @@ export class Db {
   getMeta(key: string): string | undefined {
     const r = this.db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as any;
     return r?.value;
+  }
+
+  // --- websocket catch-up cursors ---
+  // Reuses the generic `meta` table above (JSON-encoded) rather than a new table — this
+  // is a single per-channel bookmark, the same shape as e.g. the supervisor_session entry.
+
+  private cursorKey(channelId: string): string { return `mm_cursor:${channelId}`; }
+
+  getChannelCursor(channelId: string): ChannelCursor | undefined {
+    const raw = this.getMeta(this.cursorKey(channelId));
+    return raw ? (JSON.parse(raw) as ChannelCursor) : undefined;
+  }
+
+  setChannelCursor(channelId: string, cursor: ChannelCursor): void {
+    this.setMeta(this.cursorKey(channelId), JSON.stringify(cursor));
   }
 
   // --- incidents ---
