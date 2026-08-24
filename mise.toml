@@ -1,3 +1,4 @@
 [tools]
+kubectl = "latest"
 node = "26.2.0"
 "npm:pnpm" = "11.18.0"
