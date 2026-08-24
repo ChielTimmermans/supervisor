@@ -44,6 +44,62 @@ describe('mattermost helpers', () => {
   });
 });
 
+describe('MattermostGateway websocket wiring', () => {
+  function fakeWs() {
+    return {
+      firstConnect: [] as Array<() => void>,
+      reconnect: [] as Array<() => void>,
+      missed: [] as Array<() => void>,
+      closeCbs: [] as Array<(c: number) => void>,
+      error: [] as Array<(e: unknown) => void>,
+      message: [] as Array<(m: any) => void>,
+      initialized: null as null | { url: string; token: string },
+      addFirstConnectListener(cb: () => void) { this.firstConnect.push(cb); },
+      addReconnectListener(cb: () => void) { this.reconnect.push(cb); },
+      addMissedMessageListener(cb: () => void) { this.missed.push(cb); },
+      addCloseListener(cb: (c: number) => void) { this.closeCbs.push(cb); },
+      addErrorListener(cb: (e: unknown) => void) { this.error.push(cb); },
+      addMessageListener(cb: (m: any) => void) { this.message.push(cb); },
+      initialize(url: string, token: string) { this.initialized = { url, token }; },
+      close() { /* noop */ },
+    };
+  }
+
+  it('registers a missed-message listener so the client resets its sequence after a server restart (prevents the 4001 reconnect storm)', () => {
+    const ws = fakeWs();
+    const gw = new MattermostGateway(
+      { url: 'https://chat.example.com', token: 't', channelId: 'c' },
+      [],
+      () => ws as any,
+    );
+    (gw as any).buildSocket(() => {});
+    // Without any missed-message listener the Mattermost client never resets its
+    // sequence number after a reconnect and loops forever on "missed websocket event".
+    expect(ws.missed.length).toBe(1);
+  });
+
+  it('only delivers "posted" events from inbound channels, skipping the bot\'s own posts', () => {
+    const ws = fakeWs();
+    const gw = new MattermostGateway(
+      { url: 'https://chat.example.com', token: 't', channelId: 'main' },
+      ['ingest'],
+      () => ws as any,
+    );
+    (gw as any).botId = 'bot';
+    const received: string[] = [];
+    (gw as any).buildSocket((p: { id: string }) => received.push(p.id));
+    const handler = ws.message[0];
+    const posted = (channel: string, post: object) => ({
+      event: 'posted', broadcast: { channel_id: channel }, data: { post: JSON.stringify(post) },
+    });
+    handler(posted('main', { id: 'p1', channel_id: 'main', user_id: 'u1' }));
+    handler(posted('other', { id: 'p2', channel_id: 'other', user_id: 'u1' })); // not inbound
+    handler(posted('ingest', { id: 'p3', channel_id: 'ingest', user_id: 'u2' }));
+    handler(posted('main', { id: 'p4', channel_id: 'main', user_id: 'bot' })); // own post
+    expect(received).toEqual(['p1', 'p3']);
+  });
+});
+
 describe('MattermostGateway.downloadFile', () => {
   afterEach(() => vi.unstubAllGlobals());
 
