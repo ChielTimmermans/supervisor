@@ -39,6 +39,55 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('reconnects when the SDK stream drains on its own while still running, so a later push is not lost', async () => {
+    // Simulates the reported bug: a resumed session's underlying SDK stream
+    // completes on its own after replaying history and finishing one turn —
+    // WITHOUT the caller (ClaudeSession) ever closing the prompt queue. The
+    // pre-fix runLoop() treats any drain as "done" and returns, so a later
+    // push() would sit in the queue with nothing consuming it — no error,
+    // no reply, forever. The fix must reconnect instead.
+    const received: string[] = [];
+    const queryFn = vi.fn((args: any) => {
+      const prompt = args.prompt as AsyncIterable<any>;
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        // Consume exactly one message, reply, then end the generator on this
+        // connection — mirroring the SDK ending its stream after one turn
+        // while `prompt` stays open.
+        for await (const msg of prompt) {
+          const content = msg.message?.content ?? msg.text;
+          received.push(typeof content === 'string' ? content : JSON.stringify(content));
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', result: 'ok' };
+          return;
+        }
+      })();
+    });
+
+    const s = new ClaudeSession(queryFn as any, {}, () => {});
+    s.start('first');
+
+    // First connection: consumes the initial message, then drains.
+    await vi.waitFor(() => expect(received).toContain('first'));
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+
+    // Give runLoop a tick to notice the drain and (queue now empty) park in
+    // waitForWork() rather than returning.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // An operator follow-up arrives well after the drain. Without the fix,
+    // runLoop() already returned after the first drain, so nothing is
+    // consuming `this.queue` anymore — this would be the reported bug
+    // (silent worker, zero errors, follow-ups never answered).
+    s.push('operator follow-up');
+
+    // With the fix: draining while `running` re-issues queryFn() ...
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+    // ...and the pushed message actually reaches the new stream.
+    await vi.waitFor(() => expect(received).toContain('operator follow-up'));
+
+    s.stop();
+  });
+
   // A query that rejects with a usage-limit error the first `failTimes` times it
   // is established, then behaves normally (yields session id, echoes messages).
   function flakyQuery(received: string[], failTimes: number, err: unknown) {

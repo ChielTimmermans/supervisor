@@ -37,6 +37,8 @@ class MessageQueue<T> implements AsyncIterable<T> {
     this.closed = true;
     let r; while ((r = this.resolvers.shift())) r({ value: undefined as any, done: true });
   }
+  /** True when a freshly-created iterator would receive an item immediately (nothing is waiting to consume it yet). */
+  get pending(): boolean { return this.items.length > 0; }
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: (): Promise<IteratorResult<T>> => {
@@ -60,6 +62,9 @@ export class ClaudeSession {
   private running = false;
   private stopped = false;
   private aborter = new AbortController();
+  // Resolved (all of them, then cleared) whenever there's a reason for a
+  // parked runLoop to wake up and re-check: a push() arrived, or stop() ran.
+  private idleWaiters: (() => void)[] = [];
   constructor(
     private queryFn: QueryFn,
     private opts: SessionOptions,
@@ -78,9 +83,27 @@ export class ClaudeSession {
     void this.runLoop();
   }
 
-  push(text: string): void { this.queue.push(userMessage(text)); }
+  push(text: string): void { this.queue.push(userMessage(text)); this.wakeIdleWaiters(); }
   /** Stop the session. Aborts any in-flight turn so a hung worker is actually broken, not just left running. */
-  stop(): void { this.stopped = true; this.queue.close(); this.running = false; this.aborter.abort(); }
+  stop(): void {
+    this.stopped = true;
+    this.queue.close();
+    this.running = false;
+    this.aborter.abort();
+    this.wakeIdleWaiters();
+  }
+
+  private wakeIdleWaiters(): void {
+    if (this.idleWaiters.length === 0) return;
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const w of waiters) w();
+  }
+
+  /** Parks until push() or stop() gives the runLoop a reason to re-check. */
+  private waitForWork(): Promise<void> {
+    return new Promise((resolve) => { this.idleWaiters.push(resolve); });
+  }
 
   private buildOptions(): any {
     const options: any = {
@@ -133,7 +156,25 @@ export class ClaudeSession {
           }
           if (attempt > 0) { attempt = 0; this.onResume?.(); } // first message after a pause = recovered
         }
-        return; // stream drained normally (queue closed) — nothing more to do
+        // Stream drained normally. The SDK's generator can end on its own —
+        // e.g. after a resume whose replayed history already ended cleanly —
+        // even though `this.queue` (the streaming-input prompt) is still open
+        // and this.running is still true. That is NOT "nothing more to do":
+        // this.queue is the one persistent conduit push() writes to for the
+        // life of the session, and once nothing is consuming it, every later
+        // push() (an operator follow-up) silently vanishes with no error.
+        //
+        // If stop() already flipped `running` false, we really are done.
+        if (!this.running) return;
+        // Otherwise only reconnect once there's real work: if a message is
+        // already queued (e.g. pushed in the narrow window while the old
+        // stream was draining), reconnect immediately; otherwise park until
+        // the next push()/stop() wakes us. Parking — instead of an immediate
+        // `continue` — is what keeps this from becoming a reconnect storm if
+        // the SDK keeps ending the stream instantly for this session: we only
+        // ever pay for a fresh queryFn() call in response to actual new work.
+        if (!this.queue.pending) await this.waitForWork();
+        // loop: re-establish the stream (same queue instance, same session id)
       } catch (err) {
         if (this.stopped) return; // intentional stop()/abort — not a failure to report
         const limit = this.running ? parseUsageLimit(err, this.now()) : null;
