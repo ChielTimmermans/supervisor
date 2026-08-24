@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Db } from '../src/db.js';
 import { PendingQuestions } from '../src/pending.js';
+import { DevEnvLocks } from '../src/devEnvLocks.js';
 import { Worker } from '../src/worker.js';
 import type { Config } from '../src/config.js';
 import type { Gateway } from '../src/mattermost.js';
@@ -10,8 +11,8 @@ function fakeGateway(): Gateway {
 }
 const cfg = { attachmentDir: './scratch', askUserTimeoutMs: 1000, repos: {}, mattermost: { url: '', token: '', channelId: '' }, workerConcurrency: 1, dbPath: ':memory:' } as Config;
 
-let db: Db;
-beforeEach(() => { db = new Db(':memory:'); });
+let db: Db; let devLocks: DevEnvLocks;
+beforeEach(() => { db = new Db(':memory:'); devLocks = new DevEnvLocks(db, { ttlMs: 1_000, waitTimeoutMs: 1_000 }); });
 
 describe('Worker', () => {
   it('starts a session in the repo cwd with worker tools and the task as first message', async () => {
@@ -23,7 +24,7 @@ describe('Worker', () => {
     })()) as any;
 
     const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'acme', repoPath: '/repo/acme', task: 'add rate limiting' });
-    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {} });
+    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, devLocks, record: rec, onFinish: () => {} });
     w.start();
 
     await vi.waitFor(() => expect(received).toContain('add rate limiting'));
@@ -43,7 +44,7 @@ describe('Worker', () => {
 
     const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'a', repoPath: '/a', task: 'x' });
     let finished = false;
-    const w = new Worker({ queryFn, gateway, db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => { finished = true; } });
+    const w = new Worker({ queryFn, gateway, db, pending: new PendingQuestions(db), cfg, devLocks, record: rec, onFinish: () => { finished = true; } });
     w.start();
 
     await vi.waitFor(() => expect(db.getWorker('w1')!.status).toBe('failed'));
@@ -60,7 +61,7 @@ describe('Worker', () => {
     })()) as any;
 
     const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: '(none)', repoPath: '/scratch/w1', task: 'diagnose', kind: 'investigation' });
-    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {} });
+    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, devLocks, record: rec, onFinish: () => {} });
     w.start();
 
     await vi.waitFor(() => expect(seenOptions.length).toBe(1));
@@ -85,7 +86,7 @@ describe('Worker', () => {
     })()) as any;
 
     const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'acme', repoPath: '/repo/acme', task: 'feature', kind: 'feature' });
-    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {} });
+    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, devLocks, record: rec, onFinish: () => {} });
     w.start();
 
     await vi.waitFor(() => expect(seenOptions.length).toBe(1));
@@ -105,7 +106,7 @@ describe('Worker', () => {
     })()) as any;
 
     const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'a', repoPath: '/a', task: 'x' });
-    const w = new Worker({ queryFn, gateway, db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {}, wait: () => Promise.resolve() });
+    const w = new Worker({ queryFn, gateway, db, pending: new PendingQuestions(db), cfg, devLocks, record: rec, onFinish: () => {}, wait: () => Promise.resolve() });
     w.start();
 
     await vi.waitFor(() => expect(posts.some((p) => p.threadRootId === 't1' && /paused/i.test(p.text) && /usage limit/i.test(p.text))).toBe(true));
@@ -120,7 +121,7 @@ describe('Worker', () => {
       for await (const m of args.prompt) received.push(m.message?.content ?? m.text);
     })()) as any;
     const rec = db.createWorker({ id: 'w1', threadRootId: 't1', repoName: 'a', repoPath: '/a', task: 'x' });
-    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, record: rec, onFinish: () => {} });
+    const w = new Worker({ queryFn, gateway: fakeGateway(), db, pending: new PendingQuestions(db), cfg, devLocks, record: rec, onFinish: () => {} });
     w.start();
     await vi.waitFor(() => expect(received.length).toBe(1));
     w.inject('see attached', ['/scratch/spec.md']);

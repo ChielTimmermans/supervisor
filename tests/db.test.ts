@@ -53,6 +53,41 @@ describe('Db', () => {
     expect(db.listOpenIncidents()).toEqual([]);
   });
 
+  it('holds a dev claim exclusively per repo and releases it', () => {
+    expect(db.tryClaimDev('acme', 'w1', 't1', 100)).toBe(true);
+    // second worker cannot claim the same repo
+    expect(db.tryClaimDev('acme', 'w2', 't2', 200)).toBe(false);
+    // a different repo is independent
+    expect(db.tryClaimDev('other', 'w2', 't2', 200)).toBe(true);
+    expect(db.getDevClaim('acme')).toEqual({ repoName: 'acme', workerId: 'w1', threadRootId: 't1', claimedAt: 100 });
+
+    // non-holder release is a no-op; holder release works
+    expect(db.releaseDevClaim('acme', 'w2')).toBe(false);
+    expect(db.releaseDevClaim('acme', 'w1')).toBe(true);
+    expect(db.getDevClaim('acme')).toBeUndefined();
+    // now free to claim
+    expect(db.tryClaimDev('acme', 'w2', 't2', 300)).toBe(true);
+  });
+
+  it('force-sets, force-releases, and bulk-removes claims by worker', () => {
+    db.tryClaimDev('acme', 'w1', 't1', 100);
+    db.tryClaimDev('beta', 'w1', 't1', 100);
+    db.tryClaimDev('gamma', 'w2', 't2', 100);
+
+    // force-set overwrites the holder (stale break / handoff)
+    db.forceSetDevClaim('acme', 'w3', 't3', 500);
+    expect(db.getDevClaim('acme')?.workerId).toBe('w3');
+
+    // force-release returns the prior holder
+    expect(db.forceReleaseDevClaim('gamma')?.workerId).toBe('w2');
+    expect(db.getDevClaim('gamma')).toBeUndefined();
+
+    // bulk remove by worker returns removed claims
+    const removed = db.deleteDevClaimsByWorker('w1').map((c) => c.repoName).sort();
+    expect(removed).toEqual(['beta']); // acme was reassigned to w3
+    expect(db.listDevClaims().map((c) => c.repoName).sort()).toEqual(['acme']);
+  });
+
   it('creates a queued incident and lists it, then assigns a worker to open it', () => {
     const inc = db.createIncident({
       id: 'q1', fingerprint: 'OOM', source: 'prometheus', service: null,

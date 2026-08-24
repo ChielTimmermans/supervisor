@@ -22,6 +22,7 @@ const cfg = {
   ingestChannels: [], serviceRepoMap: {}, incidentCooldownMs: 3_600_000,
   workerConcurrency: 3, investigationConcurrency: 2, askUserTimeoutMs: 1000, attachmentDir: './scratch',
   mattermost: { url: '', token: '', channelId: 'c' }, dbPath: ':memory:',
+  devClaimTtlMs: 1_800_000, devClaimWaitTimeoutMs: 900_000,
 } as Config;
 
 const post = (o: Partial<IncomingPost>): IncomingPost => ({ id: 'p', channelId: 'c', rootId: '', message: 'm', userId: 'u', fileIds: [], isOwn: false, ...o });
@@ -135,6 +136,51 @@ describe('Bridge', () => {
     await vi.waitFor(() => expect(reactions3).toContainEqual(['root-fin', 'white_check_mark']));
     // The deferred stop() actually closed the prompt stream (loop ended).
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
+  });
+
+  it('operator /release frees the worker\'s dev-env claim but keeps the worker running', async () => {
+    const res = (bridge as any).spawnWorker({ repo: 'acme', task: 'do it', threadRootId: 'root-rel' });
+    const id = res.workerId;
+    const w = db.getWorker(id)!;
+    const devLocks = (bridge as any).devLocks;
+    devLocks.claim('acme', id, 'root-rel'); // worker holds the env
+    expect(devLocks.holderOf('acme')?.workerId).toBe(id);
+
+    await bridge.handlePost(post({ id: 'rel1', rootId: 'root-rel', message: '/release' }));
+
+    expect(devLocks.holderOf('acme')).toBeUndefined();       // freed
+    expect((bridge as any).workers.has(id)).toBe(true);       // still running
+    expect(db.getWorker(id)!.status).not.toBe('finished');
+    expect(posts.some((p) => p.threadRootId === 'root-rel' && /Freed/i.test(p.text))).toBe(true);
+  });
+
+  it('operator /release hands off to a waiting worker', async () => {
+    const a = (bridge as any).spawnWorker({ repo: 'acme', task: 'a', threadRootId: 'root-A' }).workerId;
+    const devLocks = (bridge as any).devLocks;
+    devLocks.claim('acme', a, 'root-A');
+    // a second worker on the same repo waits
+    const b = (bridge as any).spawnWorker({ repo: 'acme', task: 'b', threadRootId: 'root-B' }).workerId;
+    const busy = devLocks.claim('acme', b, 'root-B');
+    expect(busy.status).toBe('busy');
+
+    await bridge.handlePost(post({ id: 'rel', rootId: 'root-A', message: '/release' }));
+    expect(devLocks.holderOf('acme')?.workerId).toBe(b);      // handed off to B
+    expect(posts.some((p) => p.threadRootId === 'root-A' && /handed it to a waiting worker/i.test(p.text))).toBe(true);
+  });
+
+  it('operator /kill force-stops a worker, frees its claim, and marks it failed', async () => {
+    const res = (bridge as any).spawnWorker({ repo: 'acme', task: 'stuck', threadRootId: 'root-kill' });
+    const id = res.workerId;
+    const devLocks = (bridge as any).devLocks;
+    devLocks.claim('acme', id, 'root-kill');
+
+    await bridge.handlePost(post({ id: 'k1', rootId: 'root-kill', message: '/kill' }));
+
+    expect((bridge as any).workers.has(id)).toBe(false);
+    expect(devLocks.holderOf('acme')).toBeUndefined();
+    expect(db.getWorker(id)!.status).toBe('failed');
+    expect(posts.some((p) => p.threadRootId === 'root-kill' && /Force-stopped/i.test(p.text))).toBe(true);
+    await vi.waitFor(() => expect(reactions).toContainEqual(['root-kill', 'x']));
   });
 
   function ingestBridge(posts: any[], sink: { pushed: string[] }, db: Db) {

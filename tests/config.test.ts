@@ -36,6 +36,18 @@ describe('loadConfig', () => {
     expect(c.investigationConcurrency).toBe(5);
   });
 
+  it('defaults dev-claim TTL and wait timeout when absent', () => {
+    const c = loadConfig(base, repos);
+    expect(c.devClaimTtlMs).toBe(1_800_000);
+    expect(c.devClaimWaitTimeoutMs).toBe(900_000);
+  });
+
+  it('parses dev-claim TTL and wait timeout from env', () => {
+    const c = loadConfig({ ...base, DEV_CLAIM_TTL_MS: '60000', DEV_CLAIM_WAIT_TIMEOUT_MS: '30000' } as any, repos);
+    expect(c.devClaimTtlMs).toBe(60_000);
+    expect(c.devClaimWaitTimeoutMs).toBe(30_000);
+  });
+
   it('defaults ingest/monitoring config when absent', () => {
     const c = loadConfig(base, repos);
     expect(c.ingestChannels).toEqual([]);

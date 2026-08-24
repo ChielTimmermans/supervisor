@@ -49,6 +49,21 @@ export function normalizeIncomingPost(raw: Post, botUserId: string): IncomingPos
   };
 }
 
+/**
+ * The subset of `@mattermost/client`'s WebSocketClient we depend on. Declaring it
+ * lets tests inject a fake socket to verify listener wiring without a real connection.
+ */
+export interface WsClientLike {
+  addFirstConnectListener(cb: () => void): void;
+  addReconnectListener(cb: () => void): void;
+  addMissedMessageListener(cb: () => void): void;
+  addCloseListener(cb: (connectFailCount: number) => void): void;
+  addErrorListener(cb: (err: unknown) => void): void;
+  addMessageListener(cb: (msg: { event: string; broadcast: { channel_id: string }; data: unknown }) => void): void;
+  initialize(url: string, token: string): void;
+  close(): void;
+}
+
 export interface Gateway {
   getBotId(): string;
   connect(onPost: (p: IncomingPost) => void): Promise<void>;
@@ -62,11 +77,18 @@ export interface Gateway {
 
 export class MattermostGateway implements Gateway {
   private client = new Client4();
-  private ws?: WebSocketClient;
+  private ws?: WsClientLike;
   private botId = '';
   private inbound: Set<string>;
 
-  constructor(private cfg: Config['mattermost'], ingestChannelIds: string[] = []) {
+  constructor(
+    private cfg: Config['mattermost'],
+    ingestChannelIds: string[] = [],
+    private createWsClient: () => WsClientLike = () =>
+      new WebSocketClient({
+        newWebSocketFn: (url: string) => new WebSocket(url) as unknown as globalThis.WebSocket,
+      }) as unknown as WsClientLike,
+  ) {
     this.client.setUrl(cfg.url);
     this.client.setToken(cfg.token);
     // Inbound posts are accepted from the main channel plus every ingest channel.
@@ -80,26 +102,36 @@ export class MattermostGateway implements Gateway {
     this.botId = me.id;
     log.info('mattermost connected', { bot: `${me.username}(${me.id})`, channels: [...this.inbound].join(',') });
 
-    const ws = new WebSocketClient({
-      newWebSocketFn: (url: string) => new WebSocket(url) as unknown as globalThis.WebSocket,
-    });
+    const ws = this.buildSocket(onPost);
     this.ws = ws;
+    const wsUrl = this.cfg.url.replace(/^http/, 'ws') + '/api/v4/websocket';
+    ws.initialize(wsUrl, this.cfg.token);
+  }
+
+  /** Wire all websocket listeners. Extracted so tests can drive them with a fake socket. */
+  private buildSocket(onPost: (p: IncomingPost) => void): WsClientLike {
+    const ws = this.createWsClient();
     ws.addFirstConnectListener(() => log.info('websocket connected'));
     ws.addReconnectListener(() => log.warn('websocket reconnected'));
-    ws.addCloseListener((code: number) => log.warn('websocket closed', { code }));
+    // CRITICAL: the Mattermost client only resets its event sequence number after a
+    // reconnect if a missed-message listener is registered. Without one, a server
+    // restart/timeout makes it loop forever on "missed websocket event" → close 4001
+    // → reconnect with the same stale sequence — a permanent reconnect storm that
+    // leaves the bot deaf. Registering this handler is what enables the reset path.
+    ws.addMissedMessageListener(() => log.warn('websocket resynced after missed events (server restart or timeout)'));
+    ws.addCloseListener((connectFailCount: number) => log.warn('websocket closed', { connectFailCount }));
     ws.addErrorListener((err: unknown) => log.error('websocket error', { err: err instanceof Error ? err.message : String(err) }));
     ws.addMessageListener((msg) => {
       if (msg.event !== 'posted') return;
       if (!this.inbound.has(msg.broadcast.channel_id)) return;
-      const data = (msg as WebSocketMessages.Posted).data;
+      const data = (msg as unknown as WebSocketMessages.Posted).data;
       const raw = JSON.parse(data.post) as Post;
       const p = normalizeIncomingPost(raw, this.botId);
       if (p.isOwn) return;
       log.info('◀ post received', { id: p.id, thread: p.rootId || '(root)', user: p.userId, files: p.fileIds.length, text: preview(p.message) });
       onPost(p);
     });
-    const wsUrl = this.cfg.url.replace(/^http/, 'ws') + '/api/v4/websocket';
-    ws.initialize(wsUrl, this.cfg.token);
+    return ws;
   }
 
   async post(args: { text: string; threadRootId?: string; fileIds?: string[] }): Promise<string> {

@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import type { WorkerRecord, WorkerStatus, WorkerKind, IncidentRecord, IncidentStatus, AlertSource } from './types.js';
+import type { WorkerRecord, WorkerStatus, WorkerKind, IncidentRecord, IncidentStatus, AlertSource, DevClaim } from './types.js';
 
 export class Db {
   private db: Database.Database;
@@ -46,6 +46,12 @@ export class Db {
       );
       CREATE INDEX IF NOT EXISTS idx_incidents_fp ON incidents(fingerprint, status);
       CREATE INDEX IF NOT EXISTS idx_incidents_thread ON incidents(thread_root_id);
+      CREATE TABLE IF NOT EXISTS dev_claims (
+        repo_name TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        thread_root_id TEXT NOT NULL,
+        claimed_at INTEGER NOT NULL
+      );
     `);
     // Migration: add workers.kind to databases created before it existed.
     const cols = this.db.prepare(`PRAGMA table_info(workers)`).all() as Array<{ name: string }>;
@@ -182,6 +188,58 @@ export class Db {
 
   setIncidentStatus(id: string, status: IncidentStatus): void {
     this.db.prepare(`UPDATE incidents SET status = ?, last_seen_at = ? WHERE id = ?`).run(status, Date.now(), id);
+  }
+
+  // --- dev-env claims ---
+
+  private devClaimRow(r: any): DevClaim {
+    return { repoName: r.repo_name, workerId: r.worker_id, threadRootId: r.thread_root_id, claimedAt: r.claimed_at };
+  }
+
+  getDevClaim(repo: string): DevClaim | undefined {
+    const r = this.db.prepare(`SELECT * FROM dev_claims WHERE repo_name = ?`).get(repo);
+    return r ? this.devClaimRow(r) : undefined;
+  }
+
+  listDevClaims(): DevClaim[] {
+    return this.db.prepare(`SELECT * FROM dev_claims ORDER BY claimed_at`).all().map((r) => this.devClaimRow(r));
+  }
+
+  /** Acquire the claim only if the repo is currently unheld. Returns whether we now hold it. */
+  tryClaimDev(repo: string, workerId: string, threadRootId: string, now: number): boolean {
+    const r = this.db.prepare(
+      `INSERT INTO dev_claims (repo_name, worker_id, thread_root_id, claimed_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(repo_name) DO NOTHING`
+    ).run(repo, workerId, threadRootId, now);
+    return r.changes > 0;
+  }
+
+  /** Unconditionally set the holder (used to hand off to a promoted waiter or break a stale claim). */
+  forceSetDevClaim(repo: string, workerId: string, threadRootId: string, now: number): void {
+    this.db.prepare(
+      `INSERT INTO dev_claims (repo_name, worker_id, thread_root_id, claimed_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(repo_name) DO UPDATE SET worker_id = excluded.worker_id, thread_root_id = excluded.thread_root_id, claimed_at = excluded.claimed_at`
+    ).run(repo, workerId, threadRootId, now);
+  }
+
+  /** Release a repo's claim only if held by this worker. Returns whether a row was removed. */
+  releaseDevClaim(repo: string, workerId: string): boolean {
+    const r = this.db.prepare(`DELETE FROM dev_claims WHERE repo_name = ? AND worker_id = ?`).run(repo, workerId);
+    return r.changes > 0;
+  }
+
+  /** Remove a repo's claim regardless of holder. Returns the prior holder, if any. */
+  forceReleaseDevClaim(repo: string): DevClaim | undefined {
+    const prior = this.getDevClaim(repo);
+    this.db.prepare(`DELETE FROM dev_claims WHERE repo_name = ?`).run(repo);
+    return prior;
+  }
+
+  /** Remove every claim held by a worker (teardown). Returns the removed claims. */
+  deleteDevClaimsByWorker(workerId: string): DevClaim[] {
+    const removed = this.db.prepare(`SELECT * FROM dev_claims WHERE worker_id = ?`).all(workerId).map((r) => this.devClaimRow(r));
+    this.db.prepare(`DELETE FROM dev_claims WHERE worker_id = ?`).run(workerId);
+    return removed;
   }
 
   close(): void { this.db.close(); }
