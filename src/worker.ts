@@ -92,6 +92,7 @@ export class Worker {
         resume,
         hooks: this.clusterWriteGuardHooks(),
         wait: this.deps.wait,
+        watchdogIdleMs: this.deps.cfg.watchdogIdleMs,
       },
       (id) => { log.debug('worker session id', { worker: record.id, session: id }); this.deps.db.updateWorker(record.id, { sessionId: id }); },
       (err) => {
@@ -112,6 +113,16 @@ export class Worker {
         log.info('worker resumed after usage limit', { worker: record.id });
         void gateway.post({ text: '▶️ Resumed — usage available again.', threadRootId: record.threadRootId });
         void applyThreadStatus(gateway, record.threadRootId, 'running');
+      },
+      // Inactivity watchdog fired: the connection stopped producing any
+      // stream message for `idleMs` while a turn was nominally in progress,
+      // so we aborted just that connection and reconnected. Post this so a
+      // worker that keeps quietly recovering is visible instead of looking
+      // like nothing happened — see session.ts's DEFAULT_WATCHDOG_IDLE_MS.
+      ({ idleMs }) => {
+        const minutes = Math.round(idleMs / 60_000);
+        log.warn('worker turn watchdog fired — reconnecting', { worker: record.id, idleMs });
+        void gateway.post({ text: `⚠️ This turn seemed stuck (no activity for ~${minutes} min) — reconnecting and retrying automatically.`, threadRootId: record.threadRootId });
       },
     );
   }

@@ -88,6 +88,158 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('watchdog: reconnects when a connection produces no stream activity at all (hung, not draining)', async () => {
+    // Simulates the actual observed bug (785ca79's logging showed zero
+    // "session stream drained" lines for either real hang): the connection
+    // never drains, never errors, never yields a first message — it just
+    // sits forever inside the equivalent of `for await`. Nothing before this
+    // change could ever notice or recover from that.
+    const received: string[] = [];
+    let calls = 0;
+    const queryFn = vi.fn((args: any) => {
+      calls++;
+      const attemptNo = calls;
+      const prompt = args.prompt as AsyncIterable<any>;
+      if (attemptNo === 1) {
+        // First connection: total silence. Never yields, never resolves.
+        return (async function* () {
+          await new Promise<void>(() => {}); // never settles
+          yield undefined as never; // unreachable; keeps TS happy about the generator's yield type
+        })();
+      }
+      // Second connection (post-watchdog reconnect): behaves normally.
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        for await (const msg of prompt) {
+          const content = msg.message?.content ?? msg.text;
+          received.push(typeof content === 'string' ? content : JSON.stringify(content));
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', result: 'ok' };
+        }
+      })();
+    });
+
+    // Resolves instantly exactly ONCE (to trigger the reconnect out of the
+    // hung first connection), then parks forever. An unconditionally-instant
+    // watchdogWait would keep firing even once the SECOND connection is
+    // healthy and correctly idle waiting for more queue input (nothing else
+    // gets pushed in this test) — that's not a hang, but with idleMs
+    // irrelevant and watchdogWait always resolving immediately, the
+    // watchdog can't tell the difference and would abort+reconnect forever,
+    // spinning as fast as the microtask queue allows until the process
+    // OOMs. Caught by actually running this suite, not by reasoning about
+    // the code by hand.
+    let watchdogTicks = 0;
+    const watchdogWait = () => {
+      watchdogTicks++;
+      if (watchdogTicks > 1) return new Promise<void>(() => {}); // stop spinning after the one legitimate hang
+      return Promise.resolve();
+    };
+
+    const watchdogRetries: { idleMs: number; connectCount: number }[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      {
+        // Test seam SEPARATE from `wait` (retry backoff) specifically so
+        // this can't be confused with, or accidentally satisfied/broken by,
+        // the usage-limit tests' `wait` stub. No real sleep involved.
+        watchdogWait,
+        watchdogIdleMs: 1, // irrelevant value; the stub above ignores it
+      },
+      () => {}, () => {}, () => {}, () => {},
+      (info) => watchdogRetries.push(info),
+    );
+
+    s.start('first');
+
+    // The watchdog should fire on the first (hung) connection and reconnect.
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(watchdogRetries.length).toBe(1));
+    expect(watchdogRetries[0].connectCount).toBe(1);
+
+    // The second, healthy connection actually carries the conversation.
+    await vi.waitFor(() => expect(received).toContain('first'));
+
+    s.stop();
+  });
+
+  it('watchdog: does not fire while an ask_user tool call is outstanding, however long it takes', async () => {
+    // ask_user waits are legitimately unbounded (default 24h,
+    // askUserTimeoutMs) — a real example in data/supervisor.log ran ~9h21m
+    // before the operator replied. The watchdog must never "recover" that.
+    let toolUseYielded = false;
+    const queryFn = vi.fn((args: any) => {
+      const prompt = args.prompt as AsyncIterable<any>;
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        // Announce an ask_user tool_use, then go silent indefinitely — same
+        // shape as a real ask_user call blocked on PendingQuestions.ask().
+        yield {
+          type: 'assistant',
+          session_id: 'sess-1',
+          message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'mcp__worker__ask_user', input: {} }] },
+        };
+        toolUseYielded = true;
+        await new Promise<void>(() => {}); // never resolves — the "human hasn't replied yet" state
+        for await (const _ of prompt) { /* unreachable */ }
+      })();
+    });
+
+    // The watchdog timer polls a real (short, bounded-rate) 5ms interval
+    // for an `armed` flag rather than using instant/never-resolving
+    // Promises directly. This matters for a subtle reason found by actually
+    // running this test: `watchdogWait()` is called ONCE per pending read
+    // and its returned promise's resolution is fixed at creation time —
+    // flipping a boolean flag *after* an already-returned "never resolves"
+    // promise was created has NO effect on that promise, since nothing
+    // reevaluates it. Since this test's read-after-tool_use is a single
+    // long-lived pending read (the generator blocks forever right after
+    // yielding tool_use), there is exactly one watchdogWait() call
+    // outstanding at the moment `armed` flips — a boolean-gated
+    // "return new Promise(()=>{}) vs Promise.resolve()" design can only
+    // ever see the state as of ITS OWN creation instant, so that one call
+    // hangs forever regardless of when `armed` later becomes true. Real
+    // setTimeout-based polling doesn't have this problem: each 5ms tick
+    // freshly re-checks `armed`, so a call created before arming still
+    // resolves promptly once arming happens. It's also strictly immune to
+    // the microtask-starvation OOM this suite caught earlier (bounded-rate
+    // real timers, never a tight synchronous/microtask loop).
+    let armed = false;
+    let ticks = 0;
+    const TICK_BUDGET = 5;
+    const watchdogWait = () => new Promise<void>((resolve) => {
+      const poll = () => {
+        if (!armed) { setTimeout(poll, 5); return; }
+        ticks++;
+        if (ticks > TICK_BUDGET) return; // stop resolving; test is done sampling
+        resolve();
+      };
+      poll();
+    });
+
+    const watchdogRetries: unknown[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1 },
+      () => {}, () => {}, () => {}, () => {},
+      (info) => watchdogRetries.push(info),
+    );
+
+    s.start('first');
+    await vi.waitFor(() => expect(toolUseYielded).toBe(true));
+    // Real settling time so runLoop actually reads+tracks the already-
+    // yielded messages before the watchdog timer is allowed to resolve.
+    await new Promise((r) => setTimeout(r, 20));
+    armed = true;
+
+    // Let the bounded number of suppressed ticks actually happen.
+    await vi.waitFor(() => expect(ticks).toBeGreaterThan(TICK_BUDGET));
+
+    expect(watchdogRetries).toEqual([]);
+    expect(queryFn).toHaveBeenCalledTimes(1);
+
+    s.stop();
+  });
+
   // A query that rejects with a usage-limit error the first `failTimes` times it
   // is established, then behaves normally (yields session id, echoes messages).
   function flakyQuery(received: string[], failTimes: number, err: unknown) {

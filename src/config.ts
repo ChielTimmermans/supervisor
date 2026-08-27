@@ -18,6 +18,8 @@ export interface Config {
   devClaimTtlMs: number;
   /** How long a worker waits for a busy dev env before giving up and returning control. */
   devClaimWaitTimeoutMs: number;
+  /** Inactivity watchdog: reconnect a worker's turn if no stream message arrives for this long. */
+  watchdogIdleMs: number;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -46,5 +48,6 @@ export function loadConfig(env: NodeJS.ProcessEnv, reposJson: string): Config {
     model: env.MODEL,
     devClaimTtlMs: env.DEV_CLAIM_TTL_MS ? Number(env.DEV_CLAIM_TTL_MS) : 1_800_000, // 30 min
     devClaimWaitTimeoutMs: env.DEV_CLAIM_WAIT_TIMEOUT_MS ? Number(env.DEV_CLAIM_WAIT_TIMEOUT_MS) : 900_000, // 15 min
+    watchdogIdleMs: env.WATCHDOG_IDLE_MS ? Number(env.WATCHDOG_IDLE_MS) : 1_200_000, // 20 min
   };
 }
