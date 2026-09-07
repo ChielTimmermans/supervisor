@@ -138,6 +138,32 @@ describe('Bridge', () => {
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
   });
 
+  it('shutdown() stops every live worker, the supervisor session, and closes the gateway', async () => {
+    let n = 0;
+    const streamEnded: string[] = [];
+    const queryFn = ((args: any) => (async function* () {
+      const id = 'sess-' + (++n);
+      yield { type: 'system', session_id: id };
+      for await (const _m of args.prompt) { /* drain */ }
+      streamEnded.push(id);
+    })()) as any;
+
+    const closed: boolean[] = [];
+    const gw: Gateway = { ...fakeGateway([]), close: () => closed.push(true) };
+    const db5 = new Db(':memory:');
+    const bridge5 = new Bridge({ queryFn, gateway: gw, db: db5, cfg }); // 1st session: supervisor
+    await bridge5.start();
+
+    const res = (bridge5 as any).spawnWorker({ repo: 'acme', task: 'do it', threadRootId: 'root-sd' }); // 2nd session: worker
+    await vi.waitFor(() => expect((bridge5 as any).workers.has(res.workerId)).toBe(true));
+
+    bridge5.shutdown();
+
+    expect((bridge5 as any).workers.size).toBe(0);
+    expect(closed).toEqual([true]);
+    await vi.waitFor(() => expect(streamEnded).toHaveLength(2));
+  });
+
   it('operator /release frees the worker\'s dev-env claim but keeps the worker running', async () => {
     const res = (bridge as any).spawnWorker({ repo: 'acme', task: 'do it', threadRootId: 'root-rel' });
     const id = res.workerId;

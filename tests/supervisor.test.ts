@@ -39,4 +39,19 @@ describe('Supervisor', () => {
     await vi.waitFor(() => expect(received).toContain('you are online'));
     await vi.waitFor(() => expect(posts.some((p) => !p.threadRootId && /resumed/i.test(p.text))).toBe(true));
   });
+
+  it('stop() ends the underlying session (prompt stream closes)', async () => {
+    let ended = false;
+    const queryFn = ((args: any) => (async function* () {
+      yield { type: 'system', session_id: 'sup-stop' };
+      for await (const _m of args.prompt) { /* drain */ }
+      ended = true;
+    })()) as any;
+
+    const sup = new Supervisor({ queryFn, db, cfg, toolServer, gateway: fakeGateway([]) });
+    sup.start('you are online');
+    sup.stop();
+
+    await vi.waitFor(() => expect(ended).toBe(true));
+  });
 });

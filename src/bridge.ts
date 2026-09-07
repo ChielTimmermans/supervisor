@@ -116,6 +116,14 @@ export class Bridge {
     }
   }
 
+  /** Stop every live worker and the supervisor session, and close the gateway. Used for a graceful reload/exit. */
+  shutdown(): void {
+    for (const worker of this.workers.values()) worker.stop();
+    this.workers.clear();
+    this.supervisor?.stop();
+    this.deps.gateway.close();
+  }
+
   private onWorkerFinished(id: string): void {
     const w = this.workers.get(id);
     this.workers.delete(id);

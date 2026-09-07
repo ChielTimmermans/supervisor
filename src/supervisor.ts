@@ -56,4 +56,5 @@ export class Supervisor {
   }
   start(seed: string): void { this.session.start(seed); }
   push(text: string): void { this.session.push(text); }
+  stop(): void { this.session.stop(); }
 }
