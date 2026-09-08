@@ -144,6 +144,7 @@ describe('ClaudeSession', () => {
         // the usage-limit tests' `wait` stub. No real sleep involved.
         watchdogWait,
         watchdogIdleMs: 1, // irrelevant value; the stub above ignores it
+        watchdogGraceWait: () => Promise.resolve(), // not under test here — skip the real post-abort delay
       },
       () => {}, () => {}, () => {}, () => {},
       (info) => watchdogRetries.push(info),
@@ -158,6 +159,96 @@ describe('ClaudeSession', () => {
 
     // The second, healthy connection actually carries the conversation.
     await vi.waitFor(() => expect(received).toContain('first'));
+
+    s.stop();
+  });
+
+  it('watchdog: waits for the old connection to die before reconnecting', async () => {
+    // Aborting only sends SIGTERM; the SDK gives the process up to 5s before
+    // SIGKILL. Reconnecting in the same tick would run the dying process and
+    // the new one side by side, competing for the same resources — this test
+    // asserts the reconnect is gated on an explicit grace wait first.
+    const queryFn = vi.fn((args: any) => {
+      const prompt = args.prompt as AsyncIterable<any>;
+      if (queryFn.mock.calls.length === 1) {
+        return (async function* () { await new Promise<void>(() => {}); yield undefined as never; })();
+      }
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        for await (const _msg of prompt) { yield { type: 'result', subtype: 'success', session_id: 'sess-1', result: 'ok' }; }
+      })();
+    });
+
+    let watchdogTicks = 0;
+    const watchdogWait = () => {
+      watchdogTicks++;
+      if (watchdogTicks > 1) return new Promise<void>(() => {});
+      return Promise.resolve();
+    };
+
+    let resolveGrace!: () => void;
+    const gate = new Promise<void>((r) => (resolveGrace = r));
+    const graceCalls: number[] = [];
+    const watchdogGraceWait = (ms: number) => { graceCalls.push(ms); return gate; };
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1, watchdogGraceWait },
+      () => {}, () => {}, () => {}, () => {},
+      () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(graceCalls.length).toBe(1));
+    // The grace wait hasn't resolved yet — reconnecting must not have happened.
+    expect(queryFn).toHaveBeenCalledTimes(1);
+
+    resolveGrace();
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+
+    s.stop();
+  });
+
+  it('watchdog: jitters the idle timeout above the configured base', async () => {
+    const capturedMs: number[] = [];
+    const watchdogWait = (ms: number) => { capturedMs.push(ms); return new Promise<void>(() => {}); };
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1000, random: () => 1 }, // max draw -> +20%
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(capturedMs.length).toBeGreaterThan(0));
+    expect(capturedMs[0]).toBe(1200);
+
+    s.stop();
+  });
+
+  it('watchdog: jitters the idle timeout below the configured base with a different draw', async () => {
+    const capturedMs: number[] = [];
+    const watchdogWait = (ms: number) => { capturedMs.push(ms); return new Promise<void>(() => {}); };
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1000, random: () => 0 }, // min draw -> -20%
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(capturedMs.length).toBeGreaterThan(0));
+    expect(capturedMs[0]).toBe(800);
 
     s.stop();
   });

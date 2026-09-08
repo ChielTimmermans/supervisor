@@ -29,6 +29,23 @@ export type QueryFn = typeof import('@anthropic-ai/claude-agent-sdk').query;
 // heartbeat cadence — SessionOptions.watchdogIdleMs exists to retune it.
 export const DEFAULT_WATCHDOG_IDLE_MS = 20 * 60_000; // 20 minutes
 
+// A watchdog-fired abort() only sends SIGTERM; the SDK gives the process up
+// to 5s before escalating to SIGKILL (see sdk.mjs). Reconnecting immediately
+// would run the dying process and its replacement side by side, competing
+// for the same CPU/memory right as the new connection is doing its most
+// expensive work (replaying a large cached session) — so the watchdog waits
+// this long past abort() before reconnecting, comfortably past that 5s.
+export const DEFAULT_WATCHDOG_KILL_GRACE_MS = 5_500;
+
+// How much a connection's idle timeout is randomized around its base value
+// (watchdogIdleMs/DEFAULT_WATCHDOG_IDLE_MS), e.g. 0.2 = +/-20%. Several
+// sessions that all last connected at the same moment (e.g. every worker
+// resumed together after a process restart) would otherwise have their
+// watchdog timers permanently synchronized, retrying in lockstep every
+// cycle forever and repeatedly competing for the same resources. Jitter
+// desynchronizes them over a few cycles instead.
+const WATCHDOG_IDLE_JITTER_RATIO = 0.2;
+
 // Tool names whose in-flight tool_use legitimately blocks far longer than
 // DEFAULT_WATCHDOG_IDLE_MS on something outside the model/CLI's control (a
 // human's reply) — the watchdog must not fire while one of these is
@@ -68,6 +85,14 @@ export interface SessionOptions {
   // to skip retry backoff sleeps, and reusing the same function for the
   // watchdog would make it fire spuriously mid-message-loop in those tests.
   watchdogWait?: (ms: number) => Promise<void>;
+  // How long to wait after aborting a hung connection before reconnecting
+  // (see DEFAULT_WATCHDOG_KILL_GRACE_MS). Test seam, separate from `wait`
+  // and `watchdogWait` for the same reason those are separate from each other.
+  watchdogKillGraceMs?: number;
+  watchdogGraceWait?: (ms: number) => Promise<void>;
+  // Test seam for the watchdog's idle-timeout jitter (see
+  // WATCHDOG_IDLE_JITTER_RATIO). Defaults to Math.random.
+  random?: () => number;
 }
 
 // Minimal async queue: an async-iterable you can push to and close.
@@ -184,6 +209,22 @@ export class ClaudeSession {
     return this.opts.wait ? this.opts.wait(ms) : new Promise((r) => setTimeout(r, ms));
   }
 
+  /** Randomize a connection's idle timeout by +/-WATCHDOG_IDLE_JITTER_RATIO so repeatedly-reconnecting sessions desync over a few cycles instead of retrying in lockstep forever. */
+  private jitteredIdleMs(base: number): number {
+    const r = this.opts.random ? this.opts.random() : Math.random();
+    const factor = 1 + (r * 2 - 1) * WATCHDOG_IDLE_JITTER_RATIO;
+    return Math.round(base * factor);
+  }
+
+  /** Waits past abort()'s SIGTERM->SIGKILL escalation window before the caller reconnects, so the dying process and its replacement don't run side by side. */
+  private graceWait(ms: number): Promise<void> {
+    if (this.opts.watchdogGraceWait) return this.opts.watchdogGraceWait(ms);
+    return new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      (t as unknown as { unref?: () => void })?.unref?.();
+    });
+  }
+
   /** How long to wait before retrying a usage-limited session. */
   private retryDelay(resetAt: Date | null, attempt: number): number {
     const floor = this.opts.retryFloorMs ?? 1_000;
@@ -273,11 +314,13 @@ export class ClaudeSession {
       // tool_use ids of in-flight watchdog-exempt tools (see
       // WATCHDOG_EXEMPT_TOOLS) seen on THIS connection.
       const pendingExemptToolUseIds = new Set<string>();
+      // Drawn once per connection (not per tick) so several sessions that
+      // last connected together don't share one fixed retry cadence forever.
+      const idleMs = this.jitteredIdleMs(this.opts.watchdogIdleMs ?? DEFAULT_WATCHDOG_IDLE_MS);
 
       try {
         let nextPromise = iterator.next();
         while (true) {
-          const idleMs = this.opts.watchdogIdleMs ?? DEFAULT_WATCHDOG_IDLE_MS;
           const raced = await this.raceIdle(nextPromise, idleMs);
 
           if (raced.timedOut) {
@@ -306,7 +349,12 @@ export class ClaudeSession {
             });
             connAborter.abort();
             this.onWatchdogRetry?.({ idleMs, connectCount });
-            break; // reconnect immediately, same session id
+            // abort() only sends SIGTERM; wait past the SDK's SIGTERM->SIGKILL
+            // escalation window before reconnecting so the dying process and
+            // its replacement don't run side by side (see graceWait()).
+            await this.graceWait(this.opts.watchdogKillGraceMs ?? DEFAULT_WATCHDOG_KILL_GRACE_MS);
+            if (!this.running) return;
+            break; // reconnect, same session id
           }
 
           const msgResult = raced.value;
