@@ -26,7 +26,7 @@ const cfg = {
   ingestChannels: [], serviceRepoMap: {}, incidentCooldownMs: 3_600_000,
   workerConcurrency: 3, investigationConcurrency: 2, askUserTimeoutMs: 1000, attachmentDir: './scratch',
   mattermost: { url: '', token: '', channelId: 'c' }, dbPath: ':memory:',
-  devClaimTtlMs: 1_800_000, devClaimWaitTimeoutMs: 900_000, watchdogIdleMs: 1_200_000,
+  devClaimTtlMs: 1_800_000, devClaimWaitTimeoutMs: 900_000, watchdogIdleMs: 1_200_000, watchdogWaitingIdleMs: 10_800_000,
 } as Config;
 const post = (o: Partial<IncomingPost>): IncomingPost => ({ id: 'p', channelId: 'c', rootId: '', message: 'm', userId: 'u', fileIds: [], isOwn: false, ...o });
 

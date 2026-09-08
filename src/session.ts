@@ -16,19 +16,28 @@ export type QueryFn = typeof import('@anthropic-ai/claude-agent-sdk').query;
 //    w-db12fb73) and were only ever recovered by a full process restart
 //    (Bridge.start()'s "resumed worker" reconciliation) — nothing today
 //    detects or recovers from this automatically.
-// NOTE ON WHAT THIS DOESN'T COVER: the SDK *can* emit periodic
-// tool_progress/heartbeat messages during long-running tool calls (see
-// SDKToolProgressMessage in sdk.d.ts, which has a `heartbeat?: boolean`
-// field) — if so, those would keep resetting this timer during a
-// legitimate long Bash/build/test step and this default is very
-// conservative. We could NOT verify the actual emission interval, or
-// whether it covers SDK-hosted MCP tools, from the installed package: that
-// logic lives in the compiled per-platform CLI binary
-// (@anthropic-ai/claude-agent-sdk-linux-x64/claude), not in inspectable
-// JS/TS source (sdk.mjs has no "heartbeat" references at all). Treat this
-// default as a starting point, not a value tuned against a confirmed
-// heartbeat cadence — SessionOptions.watchdogIdleMs exists to retune it.
+// CONFIRMED (empirically, against the real API — see git history for the
+// throwaway repro): while a turn is actively in progress, the CLI reliably
+// produces activity well within this window regardless of what it's doing —
+// tool_progress/heartbeat messages every ~30s during a long Bash or SDK-MCP
+// tool call, and thinking_tokens messages every ~1-2s during extended
+// thinking with no tool call at all. So persistent silence while a turn is
+// still open (see turnEnded below) really does mean stuck. This threshold
+// does NOT apply once a turn has cleanly ended — see
+// DEFAULT_WATCHDOG_WAITING_IDLE_MS.
 export const DEFAULT_WATCHDOG_IDLE_MS = 20 * 60_000; // 20 minutes
+
+// How long to wait once a turn has ENDED (an assistant message with a
+// stop_reason and no outstanding tool_use — see turnEnded below) with
+// nothing pushed since. This is indistinguishable, from our side, from a
+// worker correctly waiting on the operator to read and reply — a real,
+// common state (a human often takes well over 20 minutes to notice a
+// message), not a hang. A genuinely dead connection in this state is rare
+// enough that a long backstop is fine; the original two "silent worker"
+// incidents this watchdog exists to catch went unnoticed for ~17h and ~7h
+// before this existed at all, so several hours of patience here is still a
+// large improvement over no recovery at all.
+export const DEFAULT_WATCHDOG_WAITING_IDLE_MS = 3 * 60 * 60_000; // 3 hours
 
 // A watchdog-fired abort() only sends SIGTERM; the SDK gives the process up
 // to 5s before escalating to SIGKILL (see sdk.mjs). Reconnecting immediately
@@ -81,6 +90,9 @@ export interface SessionOptions {
   // long while a turn is nominally in progress (see DEFAULT_WATCHDOG_IDLE_MS
   // for calibration). Exempts ask_user waits — see WATCHDOG_EXEMPT_TOOLS.
   watchdogIdleMs?: number;
+  // Idle allowance once a turn has cleanly ended with nothing pushed since —
+  // see DEFAULT_WATCHDOG_WAITING_IDLE_MS.
+  watchdogWaitingIdleMs?: number;
   // Test seam for the watchdog timer, deliberately SEPARATE from `wait`
   // above: the usage-limit tests already stub `wait` to resolve instantly
   // to skip retry backoff sleeps, and reusing the same function for the
@@ -240,13 +252,16 @@ export class ClaudeSession {
 
   /**
    * Races a pending read (`p`, always `iterator.next()`) against an idle
-   * timer. Resolves `{timedOut:false, value}` if `p` wins, `{timedOut:true}`
-   * if idleMs elapses first — WITHOUT abandoning `p`: the caller re-races
-   * the *same* promise on a suppressed (exempt-tool) timeout, so a read is
-   * never dropped or double-issued against the underlying async iterator.
+   * timer and against push()/stop() (`woken`) — WITHOUT abandoning `p`: the
+   * caller re-races the *same* promise on a suppressed (exempt-tool) tick or
+   * a wake, so a read is never dropped or double-issued against the
+   * underlying async iterator. `woken` lets an operator reply immediately
+   * shrink an already-armed long "waiting on the operator" idle window back
+   * down to the short one — see push()'s comment.
    */
-  private async raceIdle<T>(p: Promise<T>, idleMs: number): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+  private async raceIdle<T>(p: Promise<T>, idleMs: number): Promise<{ timedOut: true } | { woken: true } | { timedOut: false; value: T }> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let wakeResolver: (() => void) | undefined;
     const armIdle = (): Promise<void> => {
       if (this.opts.watchdogWait) return this.opts.watchdogWait(idleMs);
       return new Promise((resolve) => {
@@ -254,13 +269,25 @@ export class ClaudeSession {
         (timer as unknown as { unref?: () => void })?.unref?.();
       });
     };
+    const armWake = (): Promise<void> => new Promise((resolve) => {
+      wakeResolver = resolve;
+      this.idleWaiters.push(resolve);
+    });
     try {
       return await Promise.race([
         p.then((value) => ({ timedOut: false as const, value })),
         armIdle().then(() => ({ timedOut: true as const })),
+        armWake().then(() => ({ woken: true as const })),
       ]);
     } finally {
       if (timer) clearTimeout(timer);
+      // Whichever branch won, this call's own wake registration must not
+      // linger in idleWaiters forever — it would grow unboundedly over a
+      // long, chatty connection that never happens to push()/stop() mid-tick.
+      if (wakeResolver) {
+        const i = this.idleWaiters.indexOf(wakeResolver);
+        if (i >= 0) this.idleWaiters.splice(i, 1);
+      }
     }
   }
 
@@ -284,6 +311,22 @@ export class ClaudeSession {
         pending.delete(block.tool_use_id);
       }
     }
+  }
+
+  /**
+   * Whether the turn is now "ended" (waiting on the operator, not on the
+   * model) for watchdog idle-threshold purposes: an assistant message with a
+   * tool_use means work is about to happen, so the turn is NOT ended;
+   * otherwise a stop_reason means the model concluded with nothing further
+   * queued. Only assistant messages carry this signal — anything else
+   * (heartbeats, tool results, etc.) leaves the current state unchanged.
+   */
+  private nextTurnEnded(msg: any, current: boolean): boolean {
+    if (msg?.type !== 'assistant') return current;
+    const content = msg.message?.content;
+    if (Array.isArray(content) && content.some((b: any) => b?.type === 'tool_use')) return false;
+    if (msg.message?.stop_reason) return true;
+    return current;
   }
 
   private async runLoop(): Promise<void> {
@@ -315,14 +358,34 @@ export class ClaudeSession {
       // tool_use ids of in-flight watchdog-exempt tools (see
       // WATCHDOG_EXEMPT_TOOLS) seen on THIS connection.
       const pendingExemptToolUseIds = new Set<string>();
-      // Drawn once per connection (not per tick) so several sessions that
+      // Both drawn once per connection (not per tick) so several sessions that
       // last connected together don't share one fixed retry cadence forever.
-      const idleMs = this.jitteredIdleMs(this.opts.watchdogIdleMs ?? DEFAULT_WATCHDOG_IDLE_MS);
+      const activeIdleMs = this.jitteredIdleMs(this.opts.watchdogIdleMs ?? DEFAULT_WATCHDOG_IDLE_MS);
+      const waitingIdleMs = this.jitteredIdleMs(this.opts.watchdogWaitingIdleMs ?? DEFAULT_WATCHDOG_WAITING_IDLE_MS);
+      // True once the most recent assistant message ended the turn (a
+      // stop_reason with no outstanding tool_use) with nothing pushed since —
+      // i.e. the worker is waiting on the operator, not doing anything.
+      // Reset fresh per connection: right after a reconnect we don't yet know
+      // the state, so start vigilant (the short threshold) until told otherwise.
+      let turnEnded = false;
 
       try {
         let nextPromise = iterator.next();
         while (true) {
+          const idleMs = turnEnded ? waitingIdleMs : activeIdleMs;
           const raced = await this.raceIdle(nextPromise, idleMs);
+
+          if ('woken' in raced) {
+            // push()/stop() fired mid-wait. Re-race the SAME pending read —
+            // do NOT abandon it: stop()'s queue.close()/abort() can make it
+            // resolve very soon (it may already be resolving right now), and
+            // the done/error handling below already checks this.running/
+            // this.stopped correctly once it does. A live operator reply
+            // also lands here: drop back to vigilant so a dead connection
+            // doesn't wait out the rest of a long window.
+            turnEnded = false;
+            continue;
+          }
 
           if (raced.timedOut) {
             if (pendingExemptToolUseIds.size > 0) {
@@ -408,6 +471,7 @@ export class ClaudeSession {
           }
           if (attempt > 0) { attempt = 0; this.onResume?.(); } // first message after a pause = recovered
           this.trackExemptToolUse(msg, pendingExemptToolUseIds);
+          turnEnded = this.nextTurnEnded(msg, turnEnded);
 
           nextPromise = iterator.next();
         }

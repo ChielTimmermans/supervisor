@@ -253,6 +253,100 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('watchdog: switches to the much longer waiting threshold once a turn ends in plain text with no outstanding tool call', async () => {
+    // A worker that answers in plain text (not via ask_user, not via finish) and is
+    // simply waiting for the operator's reply is not hung — treat post-turn silence
+    // with a much longer allowance than mid-turn silence.
+    const capturedMs: number[] = [];
+    const watchdogWait = (ms: number) => { capturedMs.push(ms); return new Promise<void>(() => {}); };
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Here is my complete answer — what do you think?' }], stop_reason: 'end_turn' },
+      };
+      await new Promise<void>(() => {}); // then silence, waiting on the operator
+      yield undefined as never;
+    })());
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1000, watchdogWaitingIdleMs: 100_000, random: () => 0.5 }, // random=0.5 -> no jitter offset
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(capturedMs.length).toBe(3));
+    // Reads before the end_turn text use the short (active-work) threshold; the read
+    // armed right after it uses the long (waiting-on-operator) threshold.
+    expect(capturedMs).toEqual([1000, 1000, 100_000]);
+
+    s.stop();
+  });
+
+  it('watchdog: push() during a long waiting-threshold wait re-arms with the short threshold instead of waiting it out', async () => {
+    // If the connection is actually dead, waiting out the full ~3h waiting
+    // threshold after the operator has already replied would be far worse
+    // than the original ~20min detection time. An operator reply is a signal
+    // that ambient patience should reset back to vigilant.
+    const capturedMs: number[] = [];
+    const watchdogWait = (ms: number) => { capturedMs.push(ms); return new Promise<void>(() => {}); };
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'complete answer' }], stop_reason: 'end_turn' },
+      };
+      await new Promise<void>(() => {}); // dead from here — never reads input, never produces more output
+      yield undefined as never;
+    })());
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1000, watchdogWaitingIdleMs: 100_000, random: () => 0.5 },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(capturedMs).toEqual([1000, 1000, 100_000]));
+
+    s.push('operator follow-up'); // the connection is dead and will never see this, but patience should reset
+
+    await vi.waitFor(() => expect(capturedMs.length).toBe(4));
+    expect(capturedMs[3]).toBe(1000);
+
+    s.stop();
+  });
+
+  it('watchdog: keeps the short threshold while a tool call is outstanding (mid-turn), even after seeing prior activity', async () => {
+    const capturedMs: number[] = [];
+    const watchdogWait = (ms: number) => { capturedMs.push(ms); return new Promise<void>(() => {}); };
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: {} }], stop_reason: 'tool_use' },
+      };
+      await new Promise<void>(() => {}); // then silence, simulating a long-running tool
+      yield undefined as never;
+    })());
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1000, watchdogWaitingIdleMs: 100_000, random: () => 0.5 },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(capturedMs.length).toBe(3));
+    expect(capturedMs).toEqual([1000, 1000, 1000]); // stays short — a tool call is in flight, not waiting on the operator
+
+    s.stop();
+  });
+
   it('watchdog: does not fire while an ask_user tool call is outstanding, however long it takes', async () => {
     // ask_user waits are legitimately unbounded (default 24h,
     // askUserTimeoutMs) — a real example in data/supervisor.log ran ~9h21m

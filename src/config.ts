@@ -20,6 +20,8 @@ export interface Config {
   devClaimWaitTimeoutMs: number;
   /** Inactivity watchdog: reconnect a worker's turn if no stream message arrives for this long. */
   watchdogIdleMs: number;
+  /** Inactivity watchdog: idle allowance once a turn has cleanly ended and the worker is waiting on the operator. */
+  watchdogWaitingIdleMs: number;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -49,5 +51,6 @@ export function loadConfig(env: NodeJS.ProcessEnv, reposJson: string): Config {
     devClaimTtlMs: env.DEV_CLAIM_TTL_MS ? Number(env.DEV_CLAIM_TTL_MS) : 1_800_000, // 30 min
     devClaimWaitTimeoutMs: env.DEV_CLAIM_WAIT_TIMEOUT_MS ? Number(env.DEV_CLAIM_WAIT_TIMEOUT_MS) : 900_000, // 15 min
     watchdogIdleMs: env.WATCHDOG_IDLE_MS ? Number(env.WATCHDOG_IDLE_MS) : 1_200_000, // 20 min
+    watchdogWaitingIdleMs: env.WATCHDOG_WAITING_IDLE_MS ? Number(env.WATCHDOG_WAITING_IDLE_MS) : 10_800_000, // 3h
   };
 }

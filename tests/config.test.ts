@@ -48,6 +48,18 @@ describe('loadConfig', () => {
     expect(c.devClaimWaitTimeoutMs).toBe(30_000);
   });
 
+  it('defaults the watchdog idle and waiting-idle thresholds when absent', () => {
+    const c = loadConfig(base, repos);
+    expect(c.watchdogIdleMs).toBe(1_200_000);
+    expect(c.watchdogWaitingIdleMs).toBe(10_800_000);
+  });
+
+  it('parses the watchdog idle and waiting-idle thresholds from env', () => {
+    const c = loadConfig({ ...base, WATCHDOG_IDLE_MS: '5000', WATCHDOG_WAITING_IDLE_MS: '9000' } as any, repos);
+    expect(c.watchdogIdleMs).toBe(5000);
+    expect(c.watchdogWaitingIdleMs).toBe(9000);
+  });
+
   it('defaults ingest/monitoring config when absent', () => {
     const c = loadConfig(base, repos);
     expect(c.ingestChannels).toEqual([]);

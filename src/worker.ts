@@ -93,6 +93,7 @@ export class Worker {
         hooks: this.clusterWriteGuardHooks(),
         wait: this.deps.wait,
         watchdogIdleMs: this.deps.cfg.watchdogIdleMs,
+        watchdogWaitingIdleMs: this.deps.cfg.watchdogWaitingIdleMs,
       },
       (id) => { log.debug('worker session id', { worker: record.id, session: id }); this.deps.db.updateWorker(record.id, { sessionId: id }); },
       (err) => {
