@@ -1,6 +1,7 @@
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { parseUsageLimit } from './usageLimit.js';
 import { log } from './log.js';
+import { processDiagnostics } from './diagnostics.js';
 
 export type QueryFn = typeof import('@anthropic-ai/claude-agent-sdk').query;
 
@@ -346,6 +347,7 @@ export class ClaudeSession {
             log.warn('session watchdog fired — no stream activity, aborting and reconnecting', {
               sessionId: this._sessionId, connectCount, idleMs, gotFirstMessage,
               connectedForMs: Date.now() - connectStartedAt,
+              ...processDiagnostics(),
             });
             connAborter.abort();
             this.onWatchdogRetry?.({ idleMs, connectCount });
