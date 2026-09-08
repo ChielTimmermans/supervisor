@@ -408,7 +408,7 @@ export class ClaudeSession {
               continue;
             }
             log.warn('session watchdog fired — no stream activity, aborting and reconnecting', {
-              sessionId: this._sessionId, connectCount, idleMs, gotFirstMessage,
+              sessionId: this._sessionId, connectCount, idleMs, turnEnded, gotFirstMessage,
               connectedForMs: Date.now() - connectStartedAt,
               ...processDiagnostics(),
             });
@@ -432,7 +432,7 @@ export class ClaudeSession {
             // life of the session, and once nothing is consuming it, every later
             // push() (an operator follow-up) silently vanishes with no error.
             log.warn('session stream drained', {
-              sessionId: this._sessionId, connectCount, gotFirstMessage,
+              sessionId: this._sessionId, connectCount, gotFirstMessage, turnEnded,
               connectedForMs: Date.now() - connectStartedAt, running: this.running, queuePending: this.queue.pending,
             });
             //
@@ -471,7 +471,15 @@ export class ClaudeSession {
           }
           if (attempt > 0) { attempt = 0; this.onResume?.(); } // first message after a pause = recovered
           this.trackExemptToolUse(msg, pendingExemptToolUseIds);
+          const prevTurnEnded: boolean = turnEnded;
           turnEnded = this.nextTurnEnded(msg, turnEnded);
+          if (turnEnded !== prevTurnEnded) {
+            log.debug('session turnEnded transition', {
+              sessionId: this._sessionId, connectCount, from: prevTurnEnded, to: turnEnded,
+              msgType: msg?.type, stopReason: msg?.message?.stop_reason,
+              hasToolUse: Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use'),
+            });
+          }
 
           nextPromise = iterator.next();
         }
