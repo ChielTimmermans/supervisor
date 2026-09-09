@@ -135,6 +135,15 @@ export class Worker {
         log.error('worker gave up on in-process recovery — restarting the whole process', { worker: record.id, consecutiveSilentReconnects });
         void gateway.post({ text: `🔴 This session produced no output across ${consecutiveSilentReconnects} reconnect attempts — restarting the whole supervisor process to recover. It will pick back up here shortly.`, threadRootId: record.threadRootId });
       },
+      // The system prompt says tools are the only way to communicate, but
+      // nothing enforces that — the model can end a turn with plain text and
+      // no tool call, which would otherwise be completely invisible (no
+      // send_update/ask_user/finish ever ran). Surface it anyway so a reply
+      // is never silently lost.
+      (text) => {
+        log.warn('worker turn ended with plain text and no tool call — posting fallback', { worker: record.id, preview: text.slice(0, 200) });
+        void gateway.post({ text: `💬 ${text}`, threadRootId: record.threadRootId });
+      },
     );
   }
 

@@ -185,6 +185,16 @@ export class ClaudeSession {
     // Distinct from onWatchdogRetry: this is the "it kept happening" case
     // that callback's own doc comment anticipates, not another quiet retry.
     private onGiveUp?: (info: { connectCount: number; consecutiveSilentReconnects: number }) => void,
+    // Fired when a turn ends (a `result` message) and NO tool_use ever
+    // appeared anywhere in that turn — i.e. the model replied with plain
+    // text only. Callers (worker.ts/supervisor.ts) rely entirely on tool
+    // calls (send_update/ask_user/finish, post_to_channel) to post to
+    // Mattermost; a pure-text reply is otherwise never surfaced anywhere,
+    // even though the watchdog correctly treats it as a legitimate
+    // "waiting on the operator" state, not a hang. Real incident: a worker's
+    // reply to an operator instruction sent at 16:00:01 ended
+    // stopReason=end_turn hasToolUse=false and nothing was ever posted.
+    private onSilentTurnEnd?: (text: string) => void,
   ) {}
 
   get sessionId(): string | undefined { return this._sessionId; }
@@ -413,6 +423,10 @@ export class ClaudeSession {
       // Reset fresh per connection: right after a reconnect we don't yet know
       // the state, so start vigilant (the short threshold) until told otherwise.
       let turnEnded = false;
+      // True once any assistant message in the CURRENT turn has carried a
+      // tool_use block. Reset alongside turnEnded (new connection, new turn
+      // after push()) — see onSilentTurnEnd's doc comment on the constructor.
+      let turnHadToolUse = false;
 
       try {
         let nextPromise = iterator.next();
@@ -429,6 +443,7 @@ export class ClaudeSession {
             // also lands here: drop back to vigilant so a dead connection
             // doesn't wait out the rest of a long window.
             turnEnded = false;
+            turnHadToolUse = false;
             continue;
           }
 
@@ -536,6 +551,9 @@ export class ClaudeSession {
           }
           if (attempt > 0) { attempt = 0; this.onResume?.(); } // first message after a pause = recovered
           this.trackExemptToolUse(msg, pendingExemptToolUseIds);
+          if (msg?.type === 'assistant' && Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use')) {
+            turnHadToolUse = true;
+          }
           const prevTurnEnded: boolean = turnEnded;
           turnEnded = this.nextTurnEnded(msg, turnEnded);
           if (turnEnded !== prevTurnEnded) {
@@ -546,6 +564,10 @@ export class ClaudeSession {
               msgType: msg?.type, stopReason: msg?.type === 'result' ? msg?.stop_reason : msg?.message?.stop_reason,
               hasToolUse: Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use'),
             });
+            if (msg?.type === 'result' && !turnHadToolUse && typeof msg?.result === 'string' && msg.result.trim()) {
+              this.onSilentTurnEnd?.(msg.result);
+            }
+            if (msg?.type === 'result') turnHadToolUse = false; // next turn starts fresh
           }
 
           nextPromise = iterator.next();

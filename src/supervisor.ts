@@ -66,6 +66,13 @@ export class Supervisor {
         log.error('supervisor gave up on in-process recovery — restarting the whole process', { consecutiveSilentReconnects });
         void deps.gateway.post({ text: `🔴 Supervisor produced no output across ${consecutiveSilentReconnects} reconnect attempts — restarting the whole process to recover. It will pick back up here shortly.` });
       },
+      // See worker.ts's identical callback: a plain-text-only reply (no tool
+      // call) is otherwise invisible — the supervisor only ever posts via
+      // post_to_channel/spawn_worker's own posts.
+      (text) => {
+        log.warn('supervisor turn ended with plain text and no tool call — posting fallback', { preview: text.slice(0, 200) });
+        void deps.gateway.post({ text: `💬 ${text}` });
+      },
     );
   }
   start(seed: string): void { this.session.start(seed); }

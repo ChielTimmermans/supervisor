@@ -289,6 +289,72 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('calls onSilentTurnEnd with the final text when a turn ends with no tool call at all', async () => {
+    // WORKER_SYSTEM_PROMPT says tools are the only way to communicate, but nothing
+    // enforces that — a model can end a turn with pure text and no tool_use. That
+    // reply is otherwise completely invisible (no send_update/ask_user/finish ever
+    // ran to post it). onSilentTurnEnd is the fallback that surfaces it anyway.
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Looks done to me.' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Looks done to me.' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      {},
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(silent).toEqual(['Looks done to me.']));
+
+    s.stop();
+  });
+
+  it('does not call onSilentTurnEnd when the turn used a tool before ending', async () => {
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'mcp__worker__send_update', input: {} }], stop_reason: null },
+      };
+      yield { type: 'user', session_id: 'sess-1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] } };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Posted the update.' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Posted the update.' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      {},
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 10));
+    expect(silent).toEqual([]);
+
+    s.stop();
+  });
+
   it('watchdog: push() during a long waiting-threshold wait re-arms with the short threshold instead of waiting it out', async () => {
     // If the connection is actually dead, waiting out the full ~3h waiting
     // threshold after the operator has already replied would be far worse

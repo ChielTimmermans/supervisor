@@ -132,6 +132,68 @@ describe('installSelfReload', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('respawns with process.execPath when the running node version satisfies the minimum', async () => {
+    const calls: any[] = [];
+    const spawnFn = ((cmd: string, args: string[], opts: any) => { calls.push({ cmd, args, opts }); return { unref: () => {}, pid: 1 } as any; }) as any;
+
+    installSelfReload({
+      logFile: path.join(dir, 'supervisor.log'),
+      onReload: async () => {},
+      spawnFn,
+      exit: () => {},
+      nodeVersion: 'v22.0.0',
+      findBetterNodeBin: () => { throw new Error('should not be called — the running version is already fine'); },
+    });
+
+    process.emit('SIGHUP');
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].cmd).toBe(process.execPath);
+  });
+
+  it('respawns with findBetterNodeBin\'s result instead of process.execPath when the running node version is too old', async () => {
+    // Real incident: a SIGHUP respawn ran under a stray Node v18.19.1
+    // (process.execPath was NOT the mise-managed interpreter), which crashed
+    // immediately (`Client4` export not found under an old package resolution)
+    // and cascaded into a ~1h crash loop only recovered by the external
+    // watchdog. process.execPath is whatever binary happened to launch THIS
+    // process — self-reload must not blindly trust it forever.
+    const calls: any[] = [];
+    const spawnFn = ((cmd: string, args: string[], opts: any) => { calls.push({ cmd, args, opts }); return { unref: () => {}, pid: 1 } as any; }) as any;
+
+    installSelfReload({
+      logFile: path.join(dir, 'supervisor.log'),
+      onReload: async () => {},
+      spawnFn,
+      exit: () => {},
+      nodeVersion: 'v18.19.1',
+      findBetterNodeBin: () => '/opt/node22/bin/node',
+    });
+
+    process.emit('SIGHUP');
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].cmd).toBe('/opt/node22/bin/node');
+  });
+
+  it('falls back to process.execPath (best effort) when the node version is too old and no better binary is found', async () => {
+    const calls: any[] = [];
+    const spawnFn = ((cmd: string, args: string[], opts: any) => { calls.push({ cmd, args, opts }); return { unref: () => {}, pid: 1 } as any; }) as any;
+    const exits: number[] = [];
+
+    installSelfReload({
+      logFile: path.join(dir, 'supervisor.log'),
+      onReload: async () => {},
+      spawnFn,
+      exit: (c) => exits.push(c),
+      nodeVersion: 'v18.19.1',
+      findBetterNodeBin: () => undefined,
+    });
+
+    process.emit('SIGHUP');
+    await vi.waitFor(() => expect(exits).toEqual([0]));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cmd).toBe(process.execPath);
+  });
+
   it('exits non-zero if the respawn step itself fails, but still attempts onReload', async () => {
     // logFile points inside a directory that doesn't exist, so openSync() throws.
     const badLogFile = path.join(dir, 'no-such-subdir', 'supervisor.log');
