@@ -202,7 +202,9 @@ export class ClaudeSession {
     this.stopped = true;
     this.queue.close();
     this.running = false;
+    log.debug('session stop: aborting', { sessionId: this._sessionId });
     this.aborter.abort();
+    log.debug('session stop: aborted', { sessionId: this._sessionId });
     this.wakeIdleWaiters();
   }
 

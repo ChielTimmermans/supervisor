@@ -10,6 +10,7 @@ import { Supervisor } from './supervisor.js';
 import { createSupervisorToolServer, type SupervisorToolDeps } from './tools/supervisorTools.js';
 import { applyThreadStatus } from './threadStatus.js';
 import { log, preview } from './log.js';
+import { processDiagnostics } from './diagnostics.js';
 import type { QueryFn } from './session.js';
 import type { Gateway } from './mattermost.js';
 import type { Db } from './db.js';
@@ -118,10 +119,18 @@ export class Bridge {
 
   /** Stop every live worker and the supervisor session, and close the gateway. Used for a graceful reload/exit. */
   shutdown(): void {
-    for (const worker of this.workers.values()) worker.stop();
+    log.info('bridge.shutdown: stopping workers', { count: this.workers.size, ...processDiagnostics() });
+    for (const worker of this.workers.values()) {
+      log.info('bridge.shutdown: stopping worker', { worker: worker.id });
+      worker.stop();
+      log.info('bridge.shutdown: worker stopped', { worker: worker.id });
+    }
     this.workers.clear();
+    log.info('bridge.shutdown: workers stopped, stopping supervisor');
     this.supervisor?.stop();
+    log.info('bridge.shutdown: supervisor stopped, closing gateway');
     this.deps.gateway.close();
+    log.info('bridge.shutdown: gateway closed', { ...processDiagnostics() });
   }
 
   private onWorkerFinished(id: string): void {

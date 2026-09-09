@@ -48,7 +48,9 @@ async function main() {
     stopped = true;
     log.info('shutting down');
     bridge.shutdown();
+    log.info('bridge shutdown complete, closing db');
     db.close();
+    log.info('db closed');
   };
   // Note: installSelfReload's SIGHUP path now spawns the replacement BEFORE calling
   // onReload (this gracefulStop), specifically so a crash during shutdown can't
