@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { writePidFile, installSelfReload } from '../src/selfReload.js';
+import { writePidFile, installSelfReload, defaultFindBetterNodeBin } from '../src/selfReload.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'sup-reload-')); });
@@ -13,6 +13,22 @@ describe('writePidFile', () => {
     const pidFile = path.join(dir, 'supervisor.pid');
     writePidFile(pidFile);
     expect(readFileSync(pidFile, 'utf8')).toBe(String(process.pid));
+  });
+});
+
+describe('defaultFindBetterNodeBin', () => {
+  it('picks the highest full semver version, not just the highest major (ties on major happen: mise commonly holds two installs of one major mid-upgrade)', () => {
+    for (const v of ['20.20.2', '24.18.0', '24.19.0']) mkdirSync(path.join(dir, v, 'bin'), { recursive: true });
+    expect(defaultFindBetterNodeBin(dir)).toBe(path.join(dir, '24.19.0', 'bin', 'node'));
+  });
+
+  it('returns undefined when no installed version satisfies the minimum', () => {
+    for (const v of ['18.19.1', '20.20.2']) mkdirSync(path.join(dir, v, 'bin'), { recursive: true });
+    expect(defaultFindBetterNodeBin(dir)).toBeUndefined();
+  });
+
+  it('returns undefined when the installs dir does not exist', () => {
+    expect(defaultFindBetterNodeBin(path.join(dir, 'no-such-dir'))).toBeUndefined();
   });
 });
 

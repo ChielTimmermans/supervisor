@@ -387,6 +387,13 @@ export class ClaudeSession {
     // session's lifetime (not reset per-connection), reset to 0 the moment
     // any connection gets a real message.
     let consecutiveSilentReconnects = 0;
+    // Guards onSilentTurnEnd against firing more than once for the SAME
+    // turn: a resumed connection (watchdog reconnect, or the long
+    // waiting-threshold timeout) can re-surface an already-ended turn's
+    // result on the fresh stream — see the 'session stream drained' comment
+    // above on resume replay. Session-lifetime scope (not reset per
+    // connection like turnEnded/turnHadToolUse below), only reset by push().
+    let reportedSilentTurn = false;
     while (this.running) {
       connectCount++;
       const isReconnect = connectCount > 1;
@@ -444,6 +451,7 @@ export class ClaudeSession {
             // doesn't wait out the rest of a long window.
             turnEnded = false;
             turnHadToolUse = false;
+            reportedSilentTurn = false;
             continue;
           }
 
@@ -564,8 +572,9 @@ export class ClaudeSession {
               msgType: msg?.type, stopReason: msg?.type === 'result' ? msg?.stop_reason : msg?.message?.stop_reason,
               hasToolUse: Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use'),
             });
-            if (msg?.type === 'result' && !turnHadToolUse && typeof msg?.result === 'string' && msg.result.trim()) {
+            if (msg?.type === 'result' && !turnHadToolUse && !reportedSilentTurn && typeof msg?.result === 'string' && msg.result.trim()) {
               this.onSilentTurnEnd?.(msg.result);
+              reportedSilentTurn = true;
             }
             if (msg?.type === 'result') turnHadToolUse = false; // next turn starts fresh
           }

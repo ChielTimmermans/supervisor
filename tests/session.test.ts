@@ -355,6 +355,45 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('does not re-fire onSilentTurnEnd for the same turn after a watchdog reconnect replays it', async () => {
+    // A resumed connection can re-surface the prior turn's already-ended result
+    // (see the 'session stream drained' comment on resume replay). Without a
+    // cross-connection guard, a silent-text turn that sits unanswered long
+    // enough to hit the waiting-threshold watchdog would get reposted to
+    // Mattermost every time it reconnects.
+    let calls = 0;
+    const queryFn = vi.fn((_args: any) => {
+      calls++;
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        yield {
+          type: 'assistant',
+          session_id: 'sess-1',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'still waiting' }], stop_reason: null },
+        };
+        yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'still waiting' };
+        await new Promise<void>(() => {});
+        yield undefined as never;
+      })();
+    });
+
+    const silent: string[] = [];
+    // Real (tiny) macrotask delays, not Promise.resolve() — a zero-delay stub
+    // here spins the reconnect loop as fast as the microtask queue allows.
+    const tick = () => new Promise<void>((r) => setTimeout(r, 1));
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait: tick, watchdogGraceWait: tick, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1 },
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(3)); // watchdog reconnected at least twice
+    s.stop();
+    expect(silent).toEqual(['still waiting']); // fired once, not once per connection
+  });
+
   it('watchdog: push() during a long waiting-threshold wait re-arms with the short threshold instead of waiting it out', async () => {
     // If the connection is actually dead, waiting out the full ~3h waiting
     // threshold after the operator has already replied would be far worse

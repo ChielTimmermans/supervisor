@@ -37,16 +37,29 @@ function nodeMajor(version: string): number {
   return parseInt(version.replace(/^v/, '').split('.')[0] ?? '', 10);
 }
 
+/** [major, minor, patch], missing/unparseable parts default to 0 — so ties on
+ *  major (e.g. mise holding both 24.18.0 and 24.19.0 at once, a normal
+ *  mid-upgrade state) resolve to the actual newest, not filesystem order. */
+function semverTuple(version: string): [number, number, number] {
+  const parts = version.replace(/^v/, '').split('.').map((p) => parseInt(p, 10) || 0);
+  return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+}
+
+function compareSemver(a: string, b: string): number {
+  const ta = semverTuple(a), tb = semverTuple(b);
+  for (let i = 0; i < 3; i++) if (ta[i] !== tb[i]) return tb[i] - ta[i];
+  return 0;
+}
+
 /** Best-effort scan of mise's Node installs for one satisfying MIN_NODE_MAJOR,
  *  preferring the highest version found. Returns undefined on any failure
  *  (e.g. mise isn't installed here) — callers fall back to process.execPath. */
-function defaultFindBetterNodeBin(): string | undefined {
+export function defaultFindBetterNodeBin(installsDir = path.join(homedir(), '.local/share/mise/installs/node')): string | undefined {
   try {
-    const installsDir = path.join(homedir(), '.local/share/mise/installs/node');
     const versions = readdirSync(installsDir, { withFileTypes: true })
       .filter((d) => d.isDirectory() && nodeMajor(d.name) >= MIN_NODE_MAJOR)
       .map((d) => d.name)
-      .sort((a, b) => nodeMajor(b) - nodeMajor(a));
+      .sort(compareSemver);
     if (!versions.length) return undefined;
     return path.join(installsDir, versions[0], 'bin', 'node');
   } catch {
