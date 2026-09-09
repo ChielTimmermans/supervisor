@@ -27,9 +27,9 @@ export type QueryFn = typeof import('@anthropic-ai/claude-agent-sdk').query;
 // DEFAULT_WATCHDOG_WAITING_IDLE_MS.
 export const DEFAULT_WATCHDOG_IDLE_MS = 20 * 60_000; // 20 minutes
 
-// How long to wait once a turn has ENDED (an assistant message with a
-// stop_reason and no outstanding tool_use — see turnEnded below) with
-// nothing pushed since. This is indistinguishable, from our side, from a
+// How long to wait once a turn has ENDED (a result message with no
+// outstanding tool_use since — see nextTurnEnded below) with nothing
+// pushed since. This is indistinguishable, from our side, from a
 // worker correctly waiting on the operator to read and reply — a real,
 // common state (a human often takes well over 20 minutes to notice a
 // message), not a hang. A genuinely dead connection in this state is rare
@@ -348,10 +348,9 @@ export class ClaudeSession {
    * became true, and the long waiting threshold never actually applied.)
    *
    * An assistant message with a tool_use means work is about to happen, so
-   * the turn is NOT ended — checked first since a message can carry both a
-   * tool_use and (in principle) a stop_reason. A `result` message means the
-   * turn is over, full stop. Anything else (heartbeats, tool results, the
-   * system/init handshake, etc.) leaves the current state unchanged.
+   * the turn is NOT ended. A `result` message means the turn is over, full
+   * stop. Anything else (heartbeats, tool results, the system/init
+   * handshake, etc.) leaves the current state unchanged.
    */
   private nextTurnEnded(msg: any, current: boolean): boolean {
     if (msg?.type === 'assistant') {
@@ -540,7 +539,9 @@ export class ClaudeSession {
           if (turnEnded !== prevTurnEnded) {
             log.debug('session turnEnded transition', {
               sessionId: this._sessionId, connectCount, from: prevTurnEnded, to: turnEnded,
-              msgType: msg?.type, stopReason: msg?.message?.stop_reason,
+              // result messages carry stop_reason directly on themselves, not
+              // nested under .message — see nextTurnEnded's own doc comment.
+              msgType: msg?.type, stopReason: msg?.type === 'result' ? msg?.stop_reason : msg?.message?.stop_reason,
               hasToolUse: Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use'),
             });
           }
