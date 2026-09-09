@@ -60,6 +60,16 @@ describe('loadConfig', () => {
     expect(c.watchdogWaitingIdleMs).toBe(9000);
   });
 
+  it('defaults maxConsecutiveSilentReconnects to 3 when absent', () => {
+    const c = loadConfig(base, repos);
+    expect(c.maxConsecutiveSilentReconnects).toBe(3);
+  });
+
+  it('parses maxConsecutiveSilentReconnects from env', () => {
+    const c = loadConfig({ ...base, MAX_CONSECUTIVE_SILENT_RECONNECTS: '7' } as any, repos);
+    expect(c.maxConsecutiveSilentReconnects).toBe(7);
+  });
+
   it('defaults ingest/monitoring config when absent', () => {
     const c = loadConfig(base, repos);
     expect(c.ingestChannels).toEqual([]);

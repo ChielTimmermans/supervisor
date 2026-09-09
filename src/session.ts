@@ -47,6 +47,16 @@ export const DEFAULT_WATCHDOG_WAITING_IDLE_MS = 3 * 60 * 60_000; // 3 hours
 // this long past abort() before reconnecting, comfortably past that 5s.
 export const DEFAULT_WATCHDOG_KILL_GRACE_MS = 5_500;
 
+// A real overnight incident: the same session failed to get even a single
+// stream message on 37 CONSECUTIVE reconnects over 13 hours, never once
+// recovering, with nothing noticing. Every within-process reconnect shares
+// whatever made the first one fail (see graceWait's SIGTERM->SIGKILL
+// reasoning for one known contributor) — but a full process restart has a
+// 100% observed recovery rate every time it's been tried. Past this many
+// consecutive reconnects that got zero messages, stop retrying in-process
+// and restart the whole process instead — see triggerProcessRestart().
+export const DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS = 3;
+
 // How much a connection's idle timeout is randomized around its base value
 // (watchdogIdleMs/DEFAULT_WATCHDOG_IDLE_MS), e.g. 0.2 = +/-20%. Several
 // sessions that all last connected at the same moment (e.g. every worker
@@ -106,6 +116,13 @@ export interface SessionOptions {
   // Test seam for the watchdog's idle-timeout jitter (see
   // WATCHDOG_IDLE_JITTER_RATIO). Defaults to Math.random.
   random?: () => number;
+  // How many consecutive reconnects that got zero stream messages before
+  // giving up on in-process recovery and restarting the whole process — see
+  // DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS.
+  maxConsecutiveSilentReconnects?: number;
+  // Test seam: what to call instead of actually restarting the process.
+  // Defaults to sending this process SIGHUP (installSelfReload's handler).
+  triggerProcessRestart?: () => void;
 }
 
 // Minimal async queue: an async-iterable you can push to and close.
@@ -163,6 +180,11 @@ export class ClaudeSession {
     // quiet instead of it looking like silent self-healing (or, if it keeps
     // happening, a real unresolved problem). See DEFAULT_WATCHDOG_IDLE_MS.
     private onWatchdogRetry?: (info: { idleMs: number; connectCount: number }) => void,
+    // Fired once, right before giving up on in-process recovery and
+    // restarting the whole process — see maxConsecutiveSilentReconnects.
+    // Distinct from onWatchdogRetry: this is the "it kept happening" case
+    // that callback's own doc comment anticipates, not another quiet retry.
+    private onGiveUp?: (info: { connectCount: number; consecutiveSilentReconnects: number }) => void,
   ) {}
 
   get sessionId(): string | undefined { return this._sessionId; }
@@ -329,9 +351,19 @@ export class ClaudeSession {
     return current;
   }
 
+  private triggerProcessRestart(): void {
+    if (this.opts.triggerProcessRestart) { this.opts.triggerProcessRestart(); return; }
+    process.kill(process.pid, 'SIGHUP');
+  }
+
   private async runLoop(): Promise<void> {
     let attempt = 0;
     let connectCount = 0;
+    // Consecutive reconnects that got zero stream messages — see
+    // DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS. Spans the whole
+    // session's lifetime (not reset per-connection), reset to 0 the moment
+    // any connection gets a real message.
+    let consecutiveSilentReconnects = 0;
     while (this.running) {
       connectCount++;
       const isReconnect = connectCount > 1;
@@ -407,8 +439,28 @@ export class ClaudeSession {
               if (!this.running) return;
               continue;
             }
+
+            // stop() can race in during the same tick the idle timer wins —
+            // a session merely being torn down normally must not drag the
+            // whole process down with it.
+            if (!this.running) return;
+
+            if (gotFirstMessage) consecutiveSilentReconnects = 0;
+            else consecutiveSilentReconnects++;
+            const maxSilent = this.opts.maxConsecutiveSilentReconnects ?? DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS;
+            if (consecutiveSilentReconnects >= maxSilent) {
+              log.error('session watchdog: too many consecutive silent reconnects — restarting the whole process instead', {
+                sessionId: this._sessionId, connectCount, consecutiveSilentReconnects, idleMs,
+                ...processDiagnostics(),
+              });
+              connAborter.abort();
+              this.onGiveUp?.({ connectCount, consecutiveSilentReconnects });
+              this.triggerProcessRestart();
+              return;
+            }
+
             log.warn('session watchdog fired — no stream activity, aborting and reconnecting', {
-              sessionId: this._sessionId, connectCount, idleMs, turnEnded, gotFirstMessage,
+              sessionId: this._sessionId, connectCount, idleMs, turnEnded, gotFirstMessage, consecutiveSilentReconnects,
               connectedForMs: Date.now() - connectStartedAt,
               ...processDiagnostics(),
             });

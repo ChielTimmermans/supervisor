@@ -39,6 +39,9 @@ export class Supervisor {
         disallowedTools: ['Bash', 'Write', 'Edit'],
         resume: deps.db.getMeta('supervisor_session') ?? undefined,
         wait: deps.wait,
+        watchdogIdleMs: deps.cfg.watchdogIdleMs,
+        watchdogWaitingIdleMs: deps.cfg.watchdogWaitingIdleMs,
+        maxConsecutiveSilentReconnects: deps.cfg.maxConsecutiveSilentReconnects,
       },
       (id) => { log.debug('supervisor session id', { session: id }); deps.db.setMeta('supervisor_session', id); },
       (err) => log.error('supervisor session error', { err: err instanceof Error ? err.message : String(err) }),
@@ -51,6 +54,17 @@ export class Supervisor {
       () => {
         log.info('supervisor resumed after usage limit');
         void deps.gateway.post({ text: '▶️ Supervisor resumed — usage available again.' });
+      },
+      ({ idleMs }) => {
+        const minutes = Math.round(idleMs / 60_000);
+        log.warn('supervisor turn watchdog fired — reconnecting', { idleMs });
+        void deps.gateway.post({ text: `⚠️ Supervisor seemed stuck (no activity for ~${minutes} min) — reconnecting and retrying automatically.` });
+      },
+      // Gave up on in-process recovery: see worker.ts's identical callback — the
+      // supervisor hit exactly this failure mode in a real overnight incident.
+      ({ consecutiveSilentReconnects }) => {
+        log.error('supervisor gave up on in-process recovery — restarting the whole process', { consecutiveSilentReconnects });
+        void deps.gateway.post({ text: `🔴 Supervisor produced no output across ${consecutiveSilentReconnects} reconnect attempts — restarting the whole process to recover. It will pick back up here shortly.` });
       },
     );
   }

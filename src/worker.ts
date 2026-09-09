@@ -94,6 +94,7 @@ export class Worker {
         wait: this.deps.wait,
         watchdogIdleMs: this.deps.cfg.watchdogIdleMs,
         watchdogWaitingIdleMs: this.deps.cfg.watchdogWaitingIdleMs,
+        maxConsecutiveSilentReconnects: this.deps.cfg.maxConsecutiveSilentReconnects,
       },
       (id) => { log.debug('worker session id', { worker: record.id, session: id }); this.deps.db.updateWorker(record.id, { sessionId: id }); },
       (err) => {
@@ -124,6 +125,15 @@ export class Worker {
         const minutes = Math.round(idleMs / 60_000);
         log.warn('worker turn watchdog fired — reconnecting', { worker: record.id, idleMs });
         void gateway.post({ text: `⚠️ This turn seemed stuck (no activity for ~${minutes} min) — reconnecting and retrying automatically.`, threadRootId: record.threadRootId });
+      },
+      // Gave up on in-process recovery: reconnecting repeatedly produced
+      // zero output, so the whole process is restarting instead. That
+      // restart will itself reconnect this worker — post here so the
+      // operator sees why it went quiet for longer than a normal retry,
+      // rather than it looking unexplained.
+      ({ consecutiveSilentReconnects }) => {
+        log.error('worker gave up on in-process recovery — restarting the whole process', { worker: record.id, consecutiveSilentReconnects });
+        void gateway.post({ text: `🔴 This session produced no output across ${consecutiveSilentReconnects} reconnect attempts — restarting the whole supervisor process to recover. It will pick back up here shortly.`, threadRootId: record.threadRootId });
       },
     );
   }

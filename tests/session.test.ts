@@ -425,6 +425,131 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('watchdog: after N consecutive silent reconnects, restarts the whole process instead of reconnecting again', async () => {
+    // A session that never produces a single message on ANY connection —
+    // reconnecting within-process clearly isn't helping. A real overnight
+    // incident saw this exact pattern fail 37 consecutive times over 13
+    // hours with no recovery; only a full process restart ever works.
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      await new Promise<void>(() => {}); // never yields anything at all
+      yield undefined as never;
+    })());
+
+    const watchdogWait = () => Promise.resolve();
+    const watchdogGraceWait = () => Promise.resolve();
+    const restarts: void[] = [];
+    const triggerProcessRestart = () => { restarts.push(undefined); };
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, maxConsecutiveSilentReconnects: 2, triggerProcessRestart },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(restarts.length).toBe(1));
+    // Exactly 2 connection attempts — the 2nd restarts the process instead of a 3rd reconnect.
+    expect(queryFn).toHaveBeenCalledTimes(2);
+
+    s.stop();
+  });
+
+  it('watchdog: resets the silent-reconnect counter once a connection gets any real message', async () => {
+    // Connection 2 gets a message before going silent; connections 1, 3, 4
+    // get nothing. With a threshold of 2, this must take 4 connections (not
+    // 2) to restart, since connection 2's message resets the count to 0.
+    let calls = 0;
+    const queryFn = vi.fn((_args: any) => {
+      calls++;
+      const thisCall = calls;
+      return (async function* () {
+        if (thisCall === 2) yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        await new Promise<void>(() => {});
+        yield undefined as never;
+      })();
+    });
+
+    // The 2nd armIdle() call is connection 2's FIRST read — it must hang so
+    // the immediately-yielded message wins that race instead of the (also
+    // instant) idle timer; every other call resolves (times out) right away.
+    let armIdleCalls = 0;
+    const watchdogWait = () => {
+      armIdleCalls++;
+      if (armIdleCalls === 2) return new Promise<void>(() => {});
+      return Promise.resolve();
+    };
+    const watchdogGraceWait = () => Promise.resolve();
+    const restarts: void[] = [];
+    const triggerProcessRestart = () => { restarts.push(undefined); };
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, maxConsecutiveSilentReconnects: 2, triggerProcessRestart },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(restarts.length).toBe(1));
+    expect(queryFn).toHaveBeenCalledTimes(4);
+
+    s.stop();
+  });
+
+  it('watchdog: does not restart the process if stop() raced in right as the threshold fired', async () => {
+    // stop() can flip `running` false in the same tick the idle timer wins
+    // the race (simulated here by calling it from inside the watchdogWait
+    // stub itself). A session that's merely being torn down normally must
+    // not drag the whole process down with it.
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const restarts: void[] = [];
+    const triggerProcessRestart = () => { restarts.push(undefined); };
+    let s!: ClaudeSession;
+    const watchdogWait = () => new Promise<void>((resolve) => {
+      s.stop(); // races in right as this connection's idle timer is about to fire
+      resolve();
+    });
+
+    s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogIdleMs: 1, maxConsecutiveSilentReconnects: 1, triggerProcessRestart },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(restarts).toEqual([]);
+  });
+
+  it('watchdog: calls onGiveUp with the failure count right before restarting the process', async () => {
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const watchdogWait = () => Promise.resolve();
+    const watchdogGraceWait = () => Promise.resolve();
+    const restarts: void[] = [];
+    const giveUps: { connectCount: number; consecutiveSilentReconnects: number }[] = [];
+    const triggerProcessRestart = () => { restarts.push(undefined); };
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, maxConsecutiveSilentReconnects: 2, triggerProcessRestart },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+      (info) => giveUps.push(info),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(restarts.length).toBe(1));
+    expect(giveUps).toEqual([{ connectCount: 2, consecutiveSilentReconnects: 2 }]);
+
+    s.stop();
+  });
+
   // A query that rejects with a usage-limit error the first `failTimes` times it
   // is established, then behaves normally (yields session id, echoes messages).
   function flakyQuery(received: string[], failTimes: number, err: unknown) {
