@@ -7,6 +7,7 @@ import { Bridge } from './bridge.js';
 import { log } from './log.js';
 import { installCrashGuards } from './crashGuards.js';
 import { writePidFile, installSelfReload } from './selfReload.js';
+import { DEFAULT_WATCHDOG_KILL_GRACE_MS } from './session.js';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -21,6 +22,19 @@ async function main() {
   });
   const dataDir = path.dirname(cfg.dbPath);
   await mkdir(dataDir, { recursive: true });
+  if (process.env.SUPERVISOR_RESPAWNED === '1') {
+    // Spawned as selfReload.ts's replacement — the old process might still be alive
+    // (cleanly shutting down, or — as observed in production — crashing partway
+    // through its own shutdown with no JS-level error). Wait past its
+    // SIGTERM->SIGKILL escalation window before touching the DB/gateway/sessions,
+    // so we don't race its dying children for the same session ids.
+    log.info('respawned process: waiting for the old process to fully stop', { graceMs: DEFAULT_WATCHDOG_KILL_GRACE_MS });
+    await new Promise((resolve) => setTimeout(resolve, DEFAULT_WATCHDOG_KILL_GRACE_MS));
+  }
+  // Note: during the wait above, data/supervisor.pid still names the OLD (now
+  // dead or dying) process — this process deliberately doesn't claim the
+  // pidfile until it's actually ready to take over. A `kill -HUP` aimed at
+  // that stale pid during this window is harmless (already reloading, or ESRCH).
   writePidFile(path.join(dataDir, 'supervisor.pid'));
   const db = new Db(cfg.dbPath);
   const gateway = new MattermostGateway(cfg.mattermost, cfg.ingestChannels.map((c) => c.channelId), undefined, db);
@@ -36,9 +50,10 @@ async function main() {
     bridge.shutdown();
     db.close();
   };
-  // Note: SIGINT/SIGTERM exit right after gracefulStop() returns, while installSelfReload's SIGHUP
-  // path awaits it (onReload is async) before respawning — so a SIGINT/SIGTERM arriving in that
-  // brief window can exit the process before a concurrent reload gets to spawn its replacement.
+  // Note: installSelfReload's SIGHUP path now spawns the replacement BEFORE calling
+  // onReload (this gracefulStop), specifically so a crash during shutdown can't
+  // prevent the replacement from existing — see selfReload.ts. SIGINT/SIGTERM don't
+  // spawn anything, so no equivalent race applies to them.
   process.on('SIGINT', () => { gracefulStop(); process.exit(0); });
   process.on('SIGTERM', () => { gracefulStop(); process.exit(0); });
   installSelfReload({
