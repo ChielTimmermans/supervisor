@@ -31,6 +31,7 @@ describe('installSelfReload', () => {
       onReload: async () => { reloaded = true; },
       spawnFn,
       exit: (c) => exits.push(c),
+      graceWait: () => Promise.resolve(),
     });
 
     process.emit('SIGHUP');
@@ -54,6 +55,7 @@ describe('installSelfReload', () => {
       onReload: () => gate,
       spawnFn,
       exit: (c) => exits.push(c),
+      graceWait: () => Promise.resolve(),
     });
 
     process.emit('SIGHUP');
@@ -74,6 +76,7 @@ describe('installSelfReload', () => {
       onReload: async () => { throw new Error('boom'); },
       spawnFn,
       exit: (c) => exits.push(c),
+      graceWait: () => Promise.resolve(),
     });
 
     process.emit('SIGHUP');
@@ -92,9 +95,62 @@ describe('installSelfReload', () => {
       onReload: async () => {},
       spawnFn,
       exit: (c) => exits.push(c),
+      graceWait: () => Promise.resolve(),
     });
 
     process.emit('SIGHUP');
     await vi.waitFor(() => expect(exits).toEqual([1]));
+  });
+
+  it('waits past the SIGTERM->SIGKILL escalation window before spawning the replacement', async () => {
+    // onReload only sends SIGTERM (via each session's stop()/abort()); the SDK escalates to
+    // SIGKILL after up to 5s. Spawning the replacement before that elapses would let the old
+    // process's dying children overlap with the new process's own sessions resuming the same ids.
+    const calls: unknown[] = [];
+    const spawnFn = ((cmd: string, args: string[], opts: any) => { calls.push(1); return { unref: () => {}, pid: 1 } as any; }) as any;
+    const exits: number[] = [];
+    let resolveGrace!: () => void;
+    const gate = new Promise<void>((r) => (resolveGrace = r));
+    const graceCalls: number[] = [];
+    const graceWait = (ms: number) => { graceCalls.push(ms); return gate; };
+
+    installSelfReload({
+      logFile: path.join(dir, 'supervisor.log'),
+      onReload: async () => {},
+      spawnFn,
+      exit: (c) => exits.push(c),
+      graceWait,
+    });
+
+    process.emit('SIGHUP');
+
+    await vi.waitFor(() => expect(graceCalls.length).toBe(1));
+    // The grace wait hasn't resolved yet — must not have spawned or exited yet.
+    expect(calls).toHaveLength(0);
+    expect(exits).toEqual([]);
+
+    resolveGrace();
+    await vi.waitFor(() => expect(exits).toEqual([0]));
+    expect(calls).toHaveLength(1);
+  });
+
+  it('uses a configured respawnGraceMs instead of the default when given', async () => {
+    const spawnFn = (() => ({ unref: () => {}, pid: 1 }) as any) as any;
+    const exits: number[] = [];
+    const graceCalls: number[] = [];
+    const graceWait = (ms: number) => { graceCalls.push(ms); return Promise.resolve(); };
+
+    installSelfReload({
+      logFile: path.join(dir, 'supervisor.log'),
+      onReload: async () => {},
+      spawnFn,
+      exit: (c) => exits.push(c),
+      respawnGraceMs: 1234,
+      graceWait,
+    });
+
+    process.emit('SIGHUP');
+    await vi.waitFor(() => expect(exits).toEqual([0]));
+    expect(graceCalls).toEqual([1234]);
   });
 });

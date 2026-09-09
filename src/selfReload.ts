@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { writeFileSync, openSync } from 'node:fs';
 import { log } from './log.js';
+import { DEFAULT_WATCHDOG_KILL_GRACE_MS } from './session.js';
 
 export type SpawnFn = (command: string, args: string[], options: Record<string, unknown>) => ChildProcess;
 
@@ -10,6 +11,14 @@ export interface SelfReloadDeps {
   onReload: () => Promise<void>;
   spawnFn?: SpawnFn;
   exit?: (code: number) => void;
+  // onReload only sends SIGTERM to each session's claude subprocess (via abort()); the SDK
+  // only escalates to SIGKILL after up to 5s (see session.ts's DEFAULT_WATCHDOG_KILL_GRACE_MS,
+  // the same constraint at the single-connection level). Spawning the replacement before that
+  // elapses would let the old process's dying children overlap with the new process's own
+  // sessions resuming the same session ids. Defaults to DEFAULT_WATCHDOG_KILL_GRACE_MS.
+  respawnGraceMs?: number;
+  // Test seam for the above wait.
+  graceWait?: (ms: number) => Promise<void>;
 }
 
 export function writePidFile(pidFile: string): void {
@@ -36,6 +45,12 @@ export function installSelfReload(deps: SelfReloadDeps): void {
       } catch (err) {
         log.error('graceful shutdown before reload failed', { err: err instanceof Error ? err.message : String(err) });
       }
+      const graceMs = deps.respawnGraceMs ?? DEFAULT_WATCHDOG_KILL_GRACE_MS;
+      const graceWait = deps.graceWait ?? ((ms: number) => new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, ms);
+        (t as unknown as { unref?: () => void })?.unref?.();
+      }));
+      await graceWait(graceMs);
       // By now onReload has already torn down sessions/gateway/DB, so a failure here must not
       // fall through as an unhandled rejection: that would leave the process alive with nothing
       // running and no replacement — a silent, unrecoverable zombie. Exit loudly instead.
