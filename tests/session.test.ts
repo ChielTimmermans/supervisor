@@ -394,6 +394,65 @@ describe('ClaudeSession', () => {
     expect(silent).toEqual(['still waiting']); // fired once, not once per connection
   });
 
+  it('watchdog: carries the long waiting threshold across a reconnect instead of resetting to vigilant', async () => {
+    // Real incident: once a worker legitimately finishes a turn and is waiting on
+    // the operator, resetting to the short "vigilant" threshold on every reconnect
+    // defeats the whole point of the long waiting threshold — the very first
+    // waiting-threshold reconnect (itself routine: nothing queued to send, so it
+    // gets zero messages) immediately falls back to a ~20min cadence, silently
+    // reconnecting over and over with nothing to say, racing toward
+    // maxConsecutiveSilentReconnects and forcing an unwanted full process restart
+    // roughly every hour — even though nothing was ever actually hung.
+    const capturedMs: number[] = [];
+    let calls = 0;
+    let longTimeoutsForced = 0;
+    const watchdogWait = (ms: number) => {
+      capturedMs.push(ms);
+      // The long threshold "times out" exactly once, forcing exactly one
+      // reconnect — the short (vigilant) ticks and every wait after that
+      // never resolve, so real message delivery (or the test's own stop())
+      // decides what happens next instead of an unbounded reconnect loop.
+      if (ms === 100_000 && longTimeoutsForced === 0) { longTimeoutsForced++; return Promise.resolve(); }
+      return new Promise<void>(() => {});
+    };
+    const watchdogGraceWait = () => new Promise<void>((r) => setTimeout(r, 1));
+    const queryFn = vi.fn((_args: any) => {
+      calls++;
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        if (calls === 1) {
+          yield {
+            type: 'assistant',
+            session_id: 'sess-1',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'complete answer' }], stop_reason: null },
+          };
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'ok' };
+        }
+        // Reconnects after the first: nothing queued (operator hasn't replied) — silence.
+        await new Promise<void>(() => {});
+        yield undefined as never;
+      })();
+    });
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1000, watchdogWaitingIdleMs: 100_000, random: () => 0.5 },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+    );
+    s.start('first');
+
+    // First connection: two vigilant ticks, then the result ends the turn and the
+    // third tick already goes long (matches the existing "switches to..." test).
+    // Once THAT long wait "fires" and we reconnect, the fresh connection's first
+    // tick must also be long — not reset back to 1000.
+    await vi.waitFor(() => expect(capturedMs.length).toBeGreaterThanOrEqual(5));
+    s.stop();
+
+    expect(capturedMs.slice(0, 3)).toEqual([1000, 1000, 1000]); // pre-result reads on connection 1
+    expect(capturedMs[3]).toBe(100_000); // post-result, first connection — times out, forces reconnect
+    expect(capturedMs[4]).toBe(100_000); // post-reconnect, second connection — carried forward, not reset to 1000
+  });
+
   it('watchdog: push() during a long waiting-threshold wait re-arms with the short threshold instead of waiting it out', async () => {
     // If the connection is actually dead, waiting out the full ~3h waiting
     // threshold after the operator has already replied would be far worse

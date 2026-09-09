@@ -394,6 +394,23 @@ export class ClaudeSession {
     // above on resume replay. Session-lifetime scope (not reset per
     // connection like turnEnded/turnHadToolUse below), only reset by push().
     let reportedSilentTurn = false;
+    // True once the most recent assistant message ended the turn (a
+    // stop_reason with no outstanding tool_use) with nothing pushed since —
+    // i.e. the worker is waiting on the operator, not doing anything.
+    // Session-lifetime scope (survives reconnects), only reset by push():
+    // resetting this to "vigilant" on every reconnect defeats the entire
+    // point of the long waiting threshold below. Real incident: a worker
+    // correctly waiting on the operator reconnects once when the long
+    // threshold elapses (routine — nothing queued, so it gets zero
+    // messages); if that reconnect reset back to vigilant, it starts
+    // reconnecting every ~20min with nothing to say, racing toward
+    // maxConsecutiveSilentReconnects and forcing an unwanted full process
+    // restart roughly every hour even though nothing was ever hung.
+    let turnEnded = false;
+    // True once any assistant message in the CURRENT turn has carried a
+    // tool_use block. Same session-lifetime scope as turnEnded, for the same
+    // reason — see onSilentTurnEnd's doc comment on the constructor.
+    let turnHadToolUse = false;
     while (this.running) {
       connectCount++;
       const isReconnect = connectCount > 1;
@@ -424,16 +441,6 @@ export class ClaudeSession {
       // last connected together don't share one fixed retry cadence forever.
       const activeIdleMs = this.jitteredIdleMs(this.opts.watchdogIdleMs ?? DEFAULT_WATCHDOG_IDLE_MS);
       const waitingIdleMs = this.jitteredIdleMs(this.opts.watchdogWaitingIdleMs ?? DEFAULT_WATCHDOG_WAITING_IDLE_MS);
-      // True once the most recent assistant message ended the turn (a
-      // stop_reason with no outstanding tool_use) with nothing pushed since —
-      // i.e. the worker is waiting on the operator, not doing anything.
-      // Reset fresh per connection: right after a reconnect we don't yet know
-      // the state, so start vigilant (the short threshold) until told otherwise.
-      let turnEnded = false;
-      // True once any assistant message in the CURRENT turn has carried a
-      // tool_use block. Reset alongside turnEnded (new connection, new turn
-      // after push()) — see onSilentTurnEnd's doc comment on the constructor.
-      let turnHadToolUse = false;
 
       try {
         let nextPromise = iterator.next();
