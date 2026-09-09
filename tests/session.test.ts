@@ -453,6 +453,67 @@ describe('ClaudeSession', () => {
     expect(capturedMs[4]).toBe(100_000); // post-reconnect, second connection — carried forward, not reset to 1000
   });
 
+  it('does not call onSilentTurnEnd when a tool was used earlier in the turn, even after a mid-turn reconnect', async () => {
+    // turnHadToolUse now also survives reconnects (same session-lifetime scope as
+    // turnEnded). A turn that uses a tool, then hangs and reconnects mid-turn
+    // (genuinely — turnEnded stays false, the short threshold applies), then ends
+    // via a result with no further tool use on the fresh connection, must still be
+    // recognized as tool-driven — not misreported as a silent text-only reply.
+    const capturedMs: number[] = [];
+    let calls = 0;
+    let waitInvocations = 0;
+    const watchdogWait = (ms: number) => {
+      capturedMs.push(ms);
+      waitInvocations++;
+      // Only the 3rd wait (system/init consumed, tool_use consumed, now genuinely
+      // hung with nothing more coming on this connection) times out — every other
+      // tick never resolves, so real message delivery always wins that race
+      // instead of racing two same-tick promises.
+      return waitInvocations === 3 ? Promise.resolve() : new Promise<void>(() => {});
+    };
+    const watchdogGraceWait = () => new Promise<void>((r) => setTimeout(r, 1));
+    const queryFn = vi.fn((_args: any) => {
+      calls++;
+      return (async function* () {
+        if (calls === 1) {
+          yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+          yield {
+            type: 'assistant',
+            session_id: 'sess-1',
+            message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'mcp__worker__send_update', input: {} }], stop_reason: null },
+          };
+          // Hangs here — connection dies mid-turn, no result yet.
+          await new Promise<void>(() => {});
+        } else {
+          yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+          yield {
+            type: 'assistant',
+            session_id: 'sess-1',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'Posted the update.' }], stop_reason: null },
+          };
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Posted the update.' };
+          await new Promise<void>(() => {});
+        }
+        yield undefined as never;
+      })();
+    });
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1000, watchdogWaitingIdleMs: 100_000 },
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(2));
+    await new Promise((r) => setTimeout(r, 10));
+    s.stop();
+
+    expect(silent).toEqual([]); // tool use earlier in the turn correctly suppresses the fallback
+  });
+
   it('watchdog: push() during a long waiting-threshold wait re-arms with the short threshold instead of waiting it out', async () => {
     // If the connection is actually dead, waiting out the full ~3h waiting
     // threshold after the operator has already replied would be far worse
