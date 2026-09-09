@@ -337,17 +337,29 @@ export class ClaudeSession {
 
   /**
    * Whether the turn is now "ended" (waiting on the operator, not on the
-   * model) for watchdog idle-threshold purposes: an assistant message with a
-   * tool_use means work is about to happen, so the turn is NOT ended;
-   * otherwise a stop_reason means the model concluded with nothing further
-   * queued. Only assistant messages carry this signal — anything else
-   * (heartbeats, tool results, etc.) leaves the current state unchanged.
+   * model) for watchdog idle-threshold purposes.
+   *
+   * CONFIRMED against the real API (a live repro, not assumption): an
+   * assistant message's OWN stop_reason is always null — the turn only
+   * concludes on a separate, later `result` message, which carries the
+   * real stop_reason. (An earlier version of this check looked for
+   * stop_reason on the assistant message itself; since that field is
+   * always null there, it could never fire — turnEnded silently never
+   * became true, and the long waiting threshold never actually applied.)
+   *
+   * An assistant message with a tool_use means work is about to happen, so
+   * the turn is NOT ended — checked first since a message can carry both a
+   * tool_use and (in principle) a stop_reason. A `result` message means the
+   * turn is over, full stop. Anything else (heartbeats, tool results, the
+   * system/init handshake, etc.) leaves the current state unchanged.
    */
   private nextTurnEnded(msg: any, current: boolean): boolean {
-    if (msg?.type !== 'assistant') return current;
-    const content = msg.message?.content;
-    if (Array.isArray(content) && content.some((b: any) => b?.type === 'tool_use')) return false;
-    if (msg.message?.stop_reason) return true;
+    if (msg?.type === 'assistant') {
+      const content = msg.message?.content;
+      if (Array.isArray(content) && content.some((b: any) => b?.type === 'tool_use')) return false;
+      return current;
+    }
+    if (msg?.type === 'result') return true;
     return current;
   }
 

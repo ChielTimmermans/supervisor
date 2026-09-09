@@ -261,11 +261,15 @@ describe('ClaudeSession', () => {
     const watchdogWait = (ms: number) => { capturedMs.push(ms); return new Promise<void>(() => {}); };
     const queryFn = vi.fn((_args: any) => (async function* () {
       yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      // Real shape (confirmed against the live API): the assistant message's own
+      // stop_reason is always null — the turn only concludes on the separate,
+      // later `result` message, which carries the real stop_reason.
       yield {
         type: 'assistant',
         session_id: 'sess-1',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'Here is my complete answer — what do you think?' }], stop_reason: 'end_turn' },
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Here is my complete answer — what do you think?' }], stop_reason: null },
       };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'ok' };
       await new Promise<void>(() => {}); // then silence, waiting on the operator
       yield undefined as never;
     })());
@@ -277,10 +281,10 @@ describe('ClaudeSession', () => {
     );
     s.start('first');
 
-    await vi.waitFor(() => expect(capturedMs.length).toBe(3));
-    // Reads before the end_turn text use the short (active-work) threshold; the read
-    // armed right after it uses the long (waiting-on-operator) threshold.
-    expect(capturedMs).toEqual([1000, 1000, 100_000]);
+    await vi.waitFor(() => expect(capturedMs.length).toBe(4));
+    // Reads before the result message use the short (active-work) threshold; the
+    // read armed right after it uses the long (waiting-on-operator) threshold.
+    expect(capturedMs).toEqual([1000, 1000, 1000, 100_000]);
 
     s.stop();
   });
@@ -297,8 +301,9 @@ describe('ClaudeSession', () => {
       yield {
         type: 'assistant',
         session_id: 'sess-1',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'complete answer' }], stop_reason: 'end_turn' },
+        message: { role: 'assistant', content: [{ type: 'text', text: 'complete answer' }], stop_reason: null },
       };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'ok' };
       await new Promise<void>(() => {}); // dead from here — never reads input, never produces more output
       yield undefined as never;
     })());
@@ -310,12 +315,12 @@ describe('ClaudeSession', () => {
     );
     s.start('first');
 
-    await vi.waitFor(() => expect(capturedMs).toEqual([1000, 1000, 100_000]));
+    await vi.waitFor(() => expect(capturedMs).toEqual([1000, 1000, 1000, 100_000]));
 
     s.push('operator follow-up'); // the connection is dead and will never see this, but patience should reset
 
-    await vi.waitFor(() => expect(capturedMs.length).toBe(4));
-    expect(capturedMs[3]).toBe(1000);
+    await vi.waitFor(() => expect(capturedMs.length).toBe(5));
+    expect(capturedMs[4]).toBe(1000);
 
     s.stop();
   });
