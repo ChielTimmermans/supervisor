@@ -383,7 +383,12 @@ describe('ClaudeSession', () => {
     const tick = () => new Promise<void>((r) => setTimeout(r, 1));
     const s = new ClaudeSession(
       queryFn as any,
-      { watchdogWait: tick, watchdogGraceWait: tick, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1 },
+      // triggerProcessRestart stubbed: this loop reconnects fast enough on
+      // real (if tiny) timers that it could otherwise reach the real
+      // maxConsecutiveWaitingReconnects default before the test's own
+      // calls>=3 check and stop() take effect, sending a real SIGHUP to the
+      // test runner itself (no handler installed here — it would just die).
+      { watchdogWait: tick, watchdogGraceWait: tick, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1, triggerProcessRestart: () => {} },
       () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
       (text) => silent.push(text),
     );
@@ -728,7 +733,12 @@ describe('ClaudeSession', () => {
 
     const s = new ClaudeSession(
       queryFn as any,
-      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1, maxConsecutiveSilentReconnects: 2, triggerProcessRestart },
+      // maxConsecutiveWaitingReconnects deliberately left huge: this test's
+      // own bound (calls>=5) is a lower watermark, not an exact count — real
+      // (if tiny) timers mean a few extra reconnects can slip in before
+      // stop() takes effect, and the point here is proving NONE of them ever
+      // escalate, not pinning an exact iteration count.
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1, maxConsecutiveSilentReconnects: 2, maxConsecutiveWaitingReconnects: 100_000, triggerProcessRestart },
       () => {}, () => {}, () => {}, () => {},
       (info) => retries.push(info),
       (info) => giveUps.push(info),
@@ -743,6 +753,61 @@ describe('ClaudeSession', () => {
     expect(restarts).toEqual([]);
     expect(giveUps).toEqual([]);
     expect(retries).toEqual([]); // no "seemed stuck" notification — this is routine, not a hang
+  });
+
+  it('watchdog: after enough consecutive waiting-threshold reconnects with no operator engagement, restarts the process anyway', async () => {
+    // The quiet branch above has its OWN, much longer ceiling — without one,
+    // a connection that's genuinely, permanently dead while turnEnded=true
+    // would reconnect forever with zero backstop (the exact unbounded-silence
+    // failure mode maxConsecutiveSilentReconnects exists to catch, just in
+    // this state). Once that ceiling IS reached, it should notify and
+    // restart just like the mid-turn-hang path does — reaching it is no
+    // longer "routine".
+    let calls = 0;
+    const queryFn = vi.fn((_args: any) => {
+      calls++;
+      return (async function* () {
+        if (calls === 1) {
+          yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+          yield {
+            type: 'assistant',
+            session_id: 'sess-1',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: null },
+          };
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'done' };
+        }
+        await new Promise<void>(() => {});
+        yield undefined as never;
+      })();
+    });
+
+    let waitInvocations = 0;
+    const watchdogWait = () => {
+      waitInvocations++;
+      if (waitInvocations <= 3) return new Promise<void>(() => {});
+      return Promise.resolve();
+    };
+    const watchdogGraceWait = () => Promise.resolve();
+    const restarts: void[] = [];
+    const giveUps: unknown[] = [];
+    const triggerProcessRestart = () => { restarts.push(undefined); };
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1, maxConsecutiveWaitingReconnects: 3, triggerProcessRestart },
+      () => {}, () => {}, () => {}, () => {}, () => {},
+      (info) => giveUps.push(info),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(restarts.length).toBe(1));
+    // Connection 1's own post-result timeout is waiting-reconnect #1; connections
+    // 2 and 3 are #2 and #3 — the 3rd (maxConsecutiveWaitingReconnects) restarts
+    // instead of reconnecting a 4th time.
+    expect(queryFn).toHaveBeenCalledTimes(3);
+    expect(giveUps).toEqual([{ connectCount: 3, consecutiveSilentReconnects: 3 }]);
+
+    s.stop();
   });
 
   it('watchdog: resets the silent-reconnect counter once a connection gets any real message', async () => {

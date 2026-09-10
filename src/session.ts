@@ -57,6 +57,19 @@ export const DEFAULT_WATCHDOG_KILL_GRACE_MS = 5_500;
 // and restart the whole process instead — see triggerProcessRestart().
 export const DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS = 3;
 
+// Same idea as DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS above, but
+// for reconnects that fire while turnEnded=true (waiting on the operator,
+// nothing queued) — EVERY such reconnect gets zero messages by design (a
+// resumed connection with nothing to send never emits anything at all), so
+// it needs its own, much longer ceiling rather than sharing the short one
+// tuned for "a turn was actively in progress and went dark". At the default
+// ~3h waitingIdleMs (jittered), 8 cycles is roughly a day of total silence
+// from both the connection AND the operator before giving up — without this,
+// a connection that's genuinely, permanently dead while turnEnded=true would
+// reconnect forever with no backstop at all, the same unbounded-silence
+// failure mode this whole mechanism exists to catch, just in this state.
+export const DEFAULT_WATCHDOG_MAX_CONSECUTIVE_WAITING_RECONNECTS = 8;
+
 // How much a connection's idle timeout is randomized around its base value
 // (watchdogIdleMs/DEFAULT_WATCHDOG_IDLE_MS), e.g. 0.2 = +/-20%. Several
 // sessions that all last connected at the same moment (e.g. every worker
@@ -120,6 +133,9 @@ export interface SessionOptions {
   // giving up on in-process recovery and restarting the whole process — see
   // DEFAULT_WATCHDOG_MAX_CONSECUTIVE_SILENT_RECONNECTS.
   maxConsecutiveSilentReconnects?: number;
+  // Same idea, for reconnects while turnEnded=true — see
+  // DEFAULT_WATCHDOG_MAX_CONSECUTIVE_WAITING_RECONNECTS.
+  maxConsecutiveWaitingReconnects?: number;
   // Test seam: what to call instead of actually restarting the process.
   // Defaults to sending this process SIGHUP (installSelfReload's handler).
   triggerProcessRestart?: () => void;
@@ -387,6 +403,13 @@ export class ClaudeSession {
     // session's lifetime (not reset per-connection), reset to 0 the moment
     // any connection gets a real message.
     let consecutiveSilentReconnects = 0;
+    // Consecutive waiting-threshold reconnects (turnEnded=true, nothing
+    // queued) with no operator engagement in between — see
+    // DEFAULT_WATCHDOG_MAX_CONSECUTIVE_WAITING_RECONNECTS. Separate ceiling
+    // from consecutiveSilentReconnects above: this state is EXPECTED to be
+    // silent every cycle, so it needs its own, much longer bound rather than
+    // sharing one tuned for "a turn was actively in progress and went dark".
+    let consecutiveWaitingReconnects = 0;
     // Guards onSilentTurnEnd against firing more than once for the SAME
     // turn: a resumed connection (watchdog reconnect, or the long
     // waiting-threshold timeout) can re-surface an already-ended turn's
@@ -469,6 +492,7 @@ export class ClaudeSession {
             turnEnded = false;
             turnHadToolUse = false;
             reportedSilentTurn = false;
+            consecutiveWaitingReconnects = 0;
             continue;
           }
 
@@ -508,18 +532,48 @@ export class ClaudeSession {
               // consecutiveSilentReconnects and posted a "seemed stuck"
               // notification, eventually force-restarting the whole process
               // every few hours for no actual reason — pure noise. Quietly
-              // refresh the connection instead: no counting, no notification,
-              // no escalation. A genuine operator reply still recovers fast
-              // regardless (see the 'woken' branch above), and a connection
-              // that's ALSO genuinely dead here is indistinguishable from a
-              // healthy idle one from the operator's side either way.
-              log.debug('session watchdog: waiting-threshold reconnect (routine, not a hang)', {
-                sessionId: this._sessionId, connectCount, idleMs, gotFirstMessage,
+              // refresh the connection instead: no per-cycle counting against
+              // the mid-turn-hang counter, no notification. Reaching a clean
+              // turn end is itself evidence of health, so also zero that
+              // counter — otherwise a stale partial count from an earlier,
+              // fully-resolved mid-turn hang could sit through an arbitrarily
+              // long healthy idle period and then combine with one unrelated
+              // later hang to trip a premature restart.
+              consecutiveSilentReconnects = 0;
+              // Still tracked with its OWN, much longer ceiling: without any
+              // backstop at all, a connection that's genuinely, permanently
+              // dead while turnEnded=true would silently reconnect forever —
+              // exactly the unbounded-silence failure mode
+              // maxConsecutiveSilentReconnects exists to catch in the first
+              // place (see the "37 consecutive reconnects over 13 hours"
+              // incident above), just in this state instead. A real operator
+              // reply still recovers immediately regardless (see the 'woken'
+              // branch above and the queue.pending check at connection start)
+              // — this ceiling only ever matters for total, sustained
+              // silence from BOTH sides.
+              consecutiveWaitingReconnects++;
+              const maxWaiting = this.opts.maxConsecutiveWaitingReconnects ?? DEFAULT_WATCHDOG_MAX_CONSECUTIVE_WAITING_RECONNECTS;
+              if (consecutiveWaitingReconnects >= maxWaiting) {
+                log.error('session watchdog: too many consecutive waiting-threshold reconnects with no operator engagement — restarting the whole process instead', {
+                  sessionId: this._sessionId, connectCount, consecutiveWaitingReconnects, idleMs,
+                  ...processDiagnostics(),
+                });
+                connAborter.abort();
+                this.onGiveUp?.({ connectCount, consecutiveSilentReconnects: consecutiveWaitingReconnects });
+                this.triggerProcessRestart();
+                return;
+              }
+              // log.info (not debug): this path is deliberately silent on
+              // Mattermost and never counts toward the mid-turn-hang escalation,
+              // but it should still leave a trace in LOG_FILE regardless of
+              // LOG_LEVEL configuration, since it's otherwise unobservable.
+              log.info('session watchdog: waiting-threshold reconnect (routine, not a hang)', {
+                sessionId: this._sessionId, connectCount, idleMs, gotFirstMessage, consecutiveWaitingReconnects,
               });
               connAborter.abort();
               await this.graceWait(this.opts.watchdogKillGraceMs ?? DEFAULT_WATCHDOG_KILL_GRACE_MS);
               if (!this.running) return;
-              break; // reconnect, same session id — no counting, no notify
+              break; // reconnect, same session id — no counting against the mid-turn-hang path, no notify
             }
 
             if (gotFirstMessage) consecutiveSilentReconnects = 0;
