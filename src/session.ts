@@ -407,21 +407,15 @@ export class ClaudeSession {
     // maxConsecutiveSilentReconnects and forcing an unwanted full process
     // restart roughly every hour even though nothing was ever hung.
     //
-    // Deliberate trade-off (reviewed): a connection that reconnects while
-    // turnEnded is true and gets zero messages does NOT reset back to
-    // vigilant, even though a genuinely, permanently dead connection looks
-    // identical to a healthy idle one from here — both produce silence,
-    // since a resumed connection with nothing queued never emits anything at
-    // all (confirmed live: every legitimate "waiting on the operator"
-    // reconnect tonight logged gotFirstMessage=false). Resetting on a
-    // zero-message reconnect would fire on every routine wait too, undoing
-    // this fix. Worst case this pushes maxConsecutiveSilentReconnects'
-    // give-up-and-restart out to ~3x waitingIdleMs (~9h default) for a
-    // connection that's dead AND the operator never replies — but there is
-    // no user-visible difference during that window either way, and the
-    // moment the operator DOES push() something, the 'woken' branch below
-    // forces an immediate vigilant reset regardless of the connection's true
-    // state, so real recovery time after engagement is unaffected.
+    // A reconnect that fires while turnEnded is true never counts toward
+    // consecutiveSilentReconnects and never notifies — see the `if
+    // (turnEnded)` branch in the timedOut handling below. A connection that's
+    // genuinely, permanently dead here is indistinguishable from a healthy
+    // idle one (both produce silence, since a resumed connection with
+    // nothing queued never emits anything at all — confirmed live), and a
+    // real operator reply still recovers fast regardless via the 'woken'
+    // branch, so there is no detection/escalation ceiling to trade off here
+    // at all anymore.
     let turnEnded = false;
     // True once any assistant message in the CURRENT turn has carried a
     // tool_use block. Same session-lifetime scope as turnEnded, for the same
@@ -503,6 +497,30 @@ export class ClaudeSession {
             // a session merely being torn down normally must not drag the
             // whole process down with it.
             if (!this.running) return;
+
+            if (turnEnded) {
+              // The LONG threshold elapsed while legitimately waiting on the
+              // operator with nothing queued — this is the expected shape of
+              // "correctly idle", not a hang: a resumed connection with
+              // nothing to send never emits anything at all, so EVERY such
+              // reconnect gets zero messages by design. Real incident: before
+              // this branch existed, each one still counted toward
+              // consecutiveSilentReconnects and posted a "seemed stuck"
+              // notification, eventually force-restarting the whole process
+              // every few hours for no actual reason — pure noise. Quietly
+              // refresh the connection instead: no counting, no notification,
+              // no escalation. A genuine operator reply still recovers fast
+              // regardless (see the 'woken' branch above), and a connection
+              // that's ALSO genuinely dead here is indistinguishable from a
+              // healthy idle one from the operator's side either way.
+              log.debug('session watchdog: waiting-threshold reconnect (routine, not a hang)', {
+                sessionId: this._sessionId, connectCount, idleMs, gotFirstMessage,
+              });
+              connAborter.abort();
+              await this.graceWait(this.opts.watchdogKillGraceMs ?? DEFAULT_WATCHDOG_KILL_GRACE_MS);
+              if (!this.running) return;
+              break; // reconnect, same session id — no counting, no notify
+            }
 
             if (gotFirstMessage) consecutiveSilentReconnects = 0;
             else consecutiveSilentReconnects++;

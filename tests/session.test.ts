@@ -684,6 +684,67 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('watchdog: does not notify or escalate for routine waiting-threshold reconnects — only for genuine mid-turn hangs', async () => {
+    // Real incident (2026-09-10): once a turn legitimately ends and nothing is
+    // queued, EVERY waiting-threshold reconnect gets zero messages by design (a
+    // resumed connection with nothing to send emits nothing at all) — that's
+    // not a hang, it's the expected shape of "correctly idle". Before this fix,
+    // every one of these routine reconnects still posted a "seemed stuck"
+    // notification and counted toward maxConsecutiveSilentReconnects, eventually
+    // force-restarting the whole process — pure noise, repeating every few
+    // hours with nothing ever actually wrong.
+    let calls = 0;
+    const queryFn = vi.fn((_args: any) => {
+      calls++;
+      return (async function* () {
+        if (calls === 1) {
+          yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+          yield {
+            type: 'assistant',
+            session_id: 'sess-1',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], stop_reason: null },
+          };
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'done' };
+        }
+        await new Promise<void>(() => {});
+        yield undefined as never;
+      })();
+    });
+
+    let waitInvocations = 0;
+    const watchdogWait = () => {
+      waitInvocations++;
+      // Connection 1's 3 real messages (system/init, assistant, result) must
+      // win their races — only once the turn has genuinely ended and gone
+      // silent does the timer start actually firing.
+      if (waitInvocations <= 3) return new Promise<void>(() => {});
+      return Promise.resolve();
+    };
+    const watchdogGraceWait = () => new Promise<void>((r) => setTimeout(r, 1));
+    const retries: unknown[] = [];
+    const giveUps: unknown[] = [];
+    const restarts: void[] = [];
+    const triggerProcessRestart = () => { restarts.push(undefined); };
+
+    const s = new ClaudeSession(
+      queryFn as any,
+      { watchdogWait, watchdogGraceWait, watchdogIdleMs: 1, watchdogWaitingIdleMs: 1, maxConsecutiveSilentReconnects: 2, triggerProcessRestart },
+      () => {}, () => {}, () => {}, () => {},
+      (info) => retries.push(info),
+      (info) => giveUps.push(info),
+    );
+    s.start('first');
+
+    // Well past maxConsecutiveSilentReconnects (2) — if these wrongly counted,
+    // restart would already have fired by now.
+    await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(5));
+    s.stop();
+
+    expect(restarts).toEqual([]);
+    expect(giveUps).toEqual([]);
+    expect(retries).toEqual([]); // no "seemed stuck" notification — this is routine, not a hang
+  });
+
   it('watchdog: resets the silent-reconnect counter once a connection gets any real message', async () => {
     // Connection 2 gets a message before going silent; connections 1, 3, 4
     // get nothing. With a threshold of 2, this must take 4 connections (not
