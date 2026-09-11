@@ -1,5 +1,48 @@
 import { describe, it, expect, vi } from 'vitest';
-import { ClaudeSession } from '../src/session.js';
+import { ClaudeSession, MessageQueue } from '../src/session.js';
+
+describe('MessageQueue', () => {
+  it('push() delivers to the most recently registered consumer, not an earlier one abandoned mid-read', async () => {
+    // Real incident (2026-09-11): a ClaudeSession reconnects by abandoning the
+    // current connection's generator without it ever finishing its last
+    // `iterator.next()` call on the prompt queue — the real SDK keeps calling
+    // `.next()` in a loop to forward each input item to the CLI subprocess's
+    // stdin, so that abandoned call leaves a resolver sitting in the queue
+    // forever. Two such abandoned reconnects, then two real operator
+    // messages: both got silently swallowed by the two dead connections
+    // instead of reaching the third (live) one still actually reading.
+    const q = new MessageQueue<string>();
+
+    // Two abandoned consumers, each with a permanently-pending `.next()` call
+    // (nothing ever queued for them) — exactly what a connection that's been
+    // reconnected-away-from leaves behind.
+    const abandoned1 = q[Symbol.asyncIterator]().next();
+    const abandoned2 = q[Symbol.asyncIterator]().next();
+
+    // The live (3rd) consumer registers last.
+    const live = q[Symbol.asyncIterator]().next();
+
+    q.push('the real operator message');
+
+    await expect(live).resolves.toEqual({ value: 'the real operator message', done: false });
+
+    // The two abandoned reads must NOT have received it — they should still
+    // be (harmlessly) pending, not resolved with a message meant for the
+    // live connection.
+    const raced = await Promise.race([
+      Promise.all([abandoned1, abandoned2]).then(() => 'abandoned-resolved'),
+      new Promise((r) => setTimeout(() => r('still-pending'), 20)),
+    ]);
+    expect(raced).toBe('still-pending');
+  });
+
+  it('push() still delivers normally when there is only ever one consumer', async () => {
+    const q = new MessageQueue<string>();
+    const first = q[Symbol.asyncIterator]().next();
+    q.push('hello');
+    await expect(first).resolves.toEqual({ value: 'hello', done: false });
+  });
+});
 
 // A fake query() that echoes: records every user message it receives from the
 // input iterable, and emits one result message carrying a session_id.

@@ -142,7 +142,10 @@ export interface SessionOptions {
 }
 
 // Minimal async queue: an async-iterable you can push to and close.
-class MessageQueue<T> implements AsyncIterable<T> {
+// Exported for direct unit testing — the reconnect-delivery invariant below
+// is awkward to exercise reliably through the full ClaudeSession + watchdog
+// machinery (timing-dependent races), but trivial to test in isolation here.
+export class MessageQueue<T> implements AsyncIterable<T> {
   private items: T[] = [];
   private resolvers: ((r: IteratorResult<T>) => void)[] = [];
   private closed = false;
@@ -163,6 +166,19 @@ class MessageQueue<T> implements AsyncIterable<T> {
       next: (): Promise<IteratorResult<T>> => {
         if (this.items.length) return Promise.resolve({ value: this.items.shift()!, done: false });
         if (this.closed) return Promise.resolve({ value: undefined as any, done: true });
+        // Discard any resolver already waiting here before registering this
+        // one. Only one connection is ever genuinely live at a time (the
+        // runLoop never has two concurrent pending reads on the same queue),
+        // so a resolver still sitting here when a NEW one registers can only
+        // belong to a connection that's already been abandoned by a
+        // reconnect — its generator may still be running in the background
+        // (nothing forcibly kills it), but nothing should ever again be
+        // delivered to it. Real incident: without this, push() always
+        // resolves the OLDEST pending resolver first via shift() below, so
+        // after N abandoned reconnects the next N operator messages would be
+        // silently consumed by those dead connections instead of the live one
+        // still actually reading stdin.
+        this.resolvers.length = 0;
         return new Promise((resolve) => this.resolvers.push(resolve));
       },
     };
