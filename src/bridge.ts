@@ -117,17 +117,21 @@ export class Bridge {
     }
   }
 
-  /** Stop every live worker and the supervisor session, and close the gateway. Used for a graceful reload/exit. */
-  shutdown(): void {
+  /** Stop every live worker and the supervisor session, and close the gateway. Used for a graceful reload/exit.
+   *  Uses each session's graceful drain (stopGracefully, not stop) — see ClaudeSession.drainAndStop's doc
+   *  comment: a real incident lost two operator messages that had just been push()'d into the supervisor's
+   *  queue when a SIGHUP restart landed, because the plain stop() this used to call discards anything
+   *  buffered that the runLoop hasn't picked up yet. */
+  async shutdown(): Promise<void> {
     log.info('bridge.shutdown: stopping workers', { count: this.workers.size, ...processDiagnostics() });
-    for (const worker of this.workers.values()) {
+    await Promise.all([...this.workers.values()].map(async (worker) => {
       log.info('bridge.shutdown: stopping worker', { worker: worker.id });
-      worker.stop();
+      await worker.stopGracefully();
       log.info('bridge.shutdown: worker stopped', { worker: worker.id });
-    }
+    }));
     this.workers.clear();
     log.info('bridge.shutdown: workers stopped, stopping supervisor');
-    this.supervisor?.stop();
+    await this.supervisor?.stopGracefully();
     log.info('bridge.shutdown: supervisor stopped, closing gateway');
     this.deps.gateway.close();
     log.info('bridge.shutdown: gateway closed', { ...processDiagnostics() });

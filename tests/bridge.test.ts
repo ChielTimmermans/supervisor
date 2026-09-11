@@ -157,7 +157,7 @@ describe('Bridge', () => {
     const res = (bridge5 as any).spawnWorker({ repo: 'acme', task: 'do it', threadRootId: 'root-sd' }); // 2nd session: worker
     await vi.waitFor(() => expect((bridge5 as any).workers.has(res.workerId)).toBe(true));
 
-    bridge5.shutdown();
+    await bridge5.shutdown();
 
     expect((bridge5 as any).workers.size).toBe(0);
     expect(closed).toEqual([true]);

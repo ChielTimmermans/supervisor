@@ -163,4 +163,6 @@ export class Worker {
   }
 
   stop(): void { this.session?.stop(); }
+  /** Graceful counterpart to stop() — see ClaudeSession.drainAndStop's doc comment. */
+  async stopGracefully(): Promise<void> { await this.session?.drainAndStop(); }
 }

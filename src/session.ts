@@ -250,6 +250,26 @@ export class ClaudeSession {
     this.wakeIdleWaiters();
   }
 
+  /**
+   * Graceful variant of stop(), for a planned shutdown (self-reload, process exit) rather
+   * than an operator-initiated /done. stop() closes the queue and aborts immediately,
+   * discarding anything buffered in it that the runLoop hasn't picked up yet — fine for an
+   * intentional /done, but real incident: a SIGHUP self-reload raced a push() that had just
+   * landed in the queue and not yet been read by the SDK's input generator; stop() dropped
+   * it, and --resume on the respawned process only recovers messages that were actually
+   * handed to the model, so it was lost for good with no error anywhere. Wait briefly for
+   * the queue to drain (i.e. for runLoop's SDK-facing generator to actually pick up what's
+   * buffered) before doing the same abort — a bounded wait, not a guarantee: if the runLoop
+   * is itself wedged this still falls through to stop() rather than hanging the shutdown.
+   */
+  async drainAndStop(timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.queue.pending && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    this.stop();
+  }
+
   private wakeIdleWaiters(): void {
     if (this.idleWaiters.length === 0) return;
     const waiters = this.idleWaiters;

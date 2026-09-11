@@ -43,11 +43,14 @@ async function main() {
   log.info('bridge online');
 
   let stopped = false;
-  const gracefulStop = () => {
+  const gracefulStop = async () => {
     if (stopped) return;
     stopped = true;
     log.info('shutting down');
-    bridge.shutdown();
+    // Awaited — bridge.shutdown() now drains each session's queue (stopGracefully)
+    // before aborting, so a message push()'d just before shutdown actually reaches
+    // the model instead of being silently discarded. See ClaudeSession.drainAndStop.
+    await bridge.shutdown();
     log.info('bridge shutdown complete, closing db');
     db.close();
     log.info('db closed');
@@ -56,11 +59,11 @@ async function main() {
   // onReload (this gracefulStop), specifically so a crash during shutdown can't
   // prevent the replacement from existing — see selfReload.ts. SIGINT/SIGTERM don't
   // spawn anything, so no equivalent race applies to them.
-  process.on('SIGINT', () => { gracefulStop(); process.exit(0); });
-  process.on('SIGTERM', () => { gracefulStop(); process.exit(0); });
+  process.on('SIGINT', () => { void gracefulStop().then(() => process.exit(0)); });
+  process.on('SIGTERM', () => { void gracefulStop().then(() => process.exit(0)); });
   installSelfReload({
     logFile: path.join(dataDir, 'supervisor.log'),
-    onReload: async () => gracefulStop(),
+    onReload: gracefulStop,
   });
 }
 main().catch((err) => { log.error('fatal on startup', { err: err instanceof Error ? err.message : String(err) }); console.error(err); process.exit(1); });

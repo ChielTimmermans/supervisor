@@ -82,6 +82,51 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('drainAndStop waits for a buffered message to actually reach the model before closing, instead of discarding it', async () => {
+    // Real incident: a SIGHUP self-reload raced a push() that had just landed in the
+    // queue and not yet been read by the SDK's input generator — the plain stop() this
+    // used to call closes the queue and aborts immediately, discarding whatever's still
+    // buffered. --resume on the respawned process only recovers messages that were
+    // actually handed to the model, so it was lost for good with nothing logged.
+    // drainAndStop() must wait for the buffered item to actually be picked up first.
+    const received: string[] = [];
+    let releaseGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const queryFn = vi.fn((args: any) => {
+      const prompt = args.prompt as AsyncIterable<any>;
+      return (async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+        // Don't read from `prompt` yet — simulates the model still being mid-turn on
+        // something else while a new message sits buffered, unconsumed, in the queue.
+        await gate;
+        for await (const msg of prompt) {
+          const content = msg.message?.content ?? msg.text;
+          received.push(typeof content === 'string' ? content : JSON.stringify(content));
+          yield { type: 'result', subtype: 'success', session_id: 'sess-1', result: 'ok' };
+        }
+      })();
+    });
+
+    const s = new ClaudeSession(queryFn as any, {}, () => {});
+    s.start('first');
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+
+    // At this point 'first' is sitting buffered in the queue — the fake generator
+    // has yielded its init message but is now blocked on `gate`, so nothing has
+    // iterated the queue yet.
+    const stopped = s.drainAndStop(500);
+
+    // Give the drain loop a couple of ticks so this genuinely exercises the wait
+    // rather than racing past it before the first poll.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(received).toEqual([]); // not consumed yet — still correctly waiting
+
+    releaseGate();
+    await stopped;
+
+    expect(received).toContain('first');
+  });
+
   it('reconnects when the SDK stream drains on its own while still running, so a later push is not lost', async () => {
     // Simulates the reported bug: a resumed session's underlying SDK stream
     // completes on its own after replaying history and finishing one turn —
