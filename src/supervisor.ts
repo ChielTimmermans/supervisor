@@ -42,13 +42,19 @@ export class Supervisor {
         watchdogIdleMs: deps.cfg.watchdogIdleMs,
         watchdogWaitingIdleMs: deps.cfg.watchdogWaitingIdleMs,
         maxConsecutiveSilentReconnects: deps.cfg.maxConsecutiveSilentReconnects,
-        // post_to_channel obviously reaches the operator; spawn_worker does
-        // too (bridge.ts posts its own "Started a worker..." confirmation
-        // directly, independent of the model's text). list_repos/
-        // list_workers/stop_worker don't post anything themselves — a turn
-        // that calls only one of those and then answers in plain text is
-        // exactly as invisible as a no-tool-at-all turn.
-        communicationToolNames: ['mcp__supervisor__post_to_channel', 'mcp__supervisor__spawn_worker'],
+        // Only post_to_channel is unconditionally whitelisted. spawn_worker
+        // is deliberately NOT included even though bridge.ts posts its own
+        // "Started a worker..." confirmation on success: on its failure
+        // paths (unknown repo, caught before bridge.spawnWorker even runs;
+        // at-capacity, caught inside it) nothing gets posted, so merely
+        // calling it would wrongly mark a failure-explaining turn as
+        // already-communicated — reviewed and reverted after catching this.
+        // list_repos/list_workers/stop_worker don't post anything
+        // themselves either way. Net effect: a successful spawn_worker call
+        // whose only follow-up is a redundant plain-text "started it" may
+        // get double-posted — harmless noise, not a risk of losing a real
+        // answer the way the excluded cases would be.
+        communicationToolNames: ['mcp__supervisor__post_to_channel'],
       },
       (id) => { log.debug('supervisor session id', { session: id }); deps.db.setMeta('supervisor_session', id); },
       (err) => log.error('supervisor session error', { err: err instanceof Error ? err.message : String(err) }),
