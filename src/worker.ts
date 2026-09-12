@@ -95,6 +95,12 @@ export class Worker {
         watchdogIdleMs: this.deps.cfg.watchdogIdleMs,
         watchdogWaitingIdleMs: this.deps.cfg.watchdogWaitingIdleMs,
         maxConsecutiveSilentReconnects: this.deps.cfg.maxConsecutiveSilentReconnects,
+        // Only these reach the operator directly — Bash/Read/Edit/Glob/Grep
+        // and claim_dev/release_dev don't. Real incident: a worker used Bash
+        // to investigate, then gave its actual answer as plain text with no
+        // send_update call — "any tool use counts" wrongly treated that as
+        // already-communicated.
+        communicationToolNames: ['mcp__worker__ask_user', 'mcp__worker__send_update', 'mcp__worker__finish'],
       },
       (id) => { log.debug('worker session id', { worker: record.id, session: id }); this.deps.db.updateWorker(record.id, { sessionId: id }); },
       (err) => {

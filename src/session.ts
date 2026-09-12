@@ -139,6 +139,16 @@ export interface SessionOptions {
   // Test seam: what to call instead of actually restarting the process.
   // Defaults to sending this process SIGHUP (installSelfReload's handler).
   triggerProcessRestart?: () => void;
+  // Tool names that themselves reach the operator (post to Mattermost, or
+  // equivalent) — used to decide whether a turn already communicated before
+  // onSilentTurnEnd's fallback considers it silent. Real incident: a worker
+  // used Bash to investigate, then gave its actual answer as plain text with
+  // no send_update call — "was ANY tool used" wrongly treated that as
+  // already-communicated (Bash/Read/Edit aren't), so the answer never
+  // reached the operator. Undefined means "any tool use counts" (the old,
+  // looser behavior) — callers that care should pass their real
+  // communication tool names (see worker.ts/supervisor.ts).
+  communicationToolNames?: string[];
 }
 
 // Minimal async queue: an async-iterable you can push to and close.
@@ -451,7 +461,7 @@ export class ClaudeSession {
     // waiting-threshold timeout) can re-surface an already-ended turn's
     // result on the fresh stream — see the 'session stream drained' comment
     // above on resume replay. Session-lifetime scope (not reset per
-    // connection like turnEnded/turnHadToolUse below), only reset by push().
+    // connection like turnEnded/turnCommunicated below), only reset by push().
     let reportedSilentTurn = false;
     // True once the most recent assistant message ended the turn (a
     // stop_reason with no outstanding tool_use) with nothing pushed since —
@@ -477,9 +487,11 @@ export class ClaudeSession {
     // at all anymore.
     let turnEnded = false;
     // True once any assistant message in the CURRENT turn has carried a
-    // tool_use block. Same session-lifetime scope as turnEnded, for the same
-    // reason — see onSilentTurnEnd's doc comment on the constructor.
-    let turnHadToolUse = false;
+    // tool_use block that counts as reaching the operator — see
+    // communicationToolNames's doc comment. Same session-lifetime scope as
+    // turnEnded, for the same reason — see onSilentTurnEnd's doc comment on
+    // the constructor.
+    let turnCommunicated = false;
     while (this.running) {
       connectCount++;
       const isReconnect = connectCount > 1;
@@ -526,7 +538,7 @@ export class ClaudeSession {
             // also lands here: drop back to vigilant so a dead connection
             // doesn't wait out the rest of a long window.
             turnEnded = false;
-            turnHadToolUse = false;
+            turnCommunicated = false;
             reportedSilentTurn = false;
             consecutiveWaitingReconnects = 0;
             continue;
@@ -690,8 +702,10 @@ export class ClaudeSession {
           }
           if (attempt > 0) { attempt = 0; this.onResume?.(); } // first message after a pause = recovered
           this.trackExemptToolUse(msg, pendingExemptToolUseIds);
-          if (msg?.type === 'assistant' && Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use')) {
-            turnHadToolUse = true;
+          if (msg?.type === 'assistant' && Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) =>
+            b?.type === 'tool_use' && (!this.opts.communicationToolNames || this.opts.communicationToolNames.includes(b.name))
+          )) {
+            turnCommunicated = true;
           }
           const prevTurnEnded: boolean = turnEnded;
           turnEnded = this.nextTurnEnded(msg, turnEnded);
@@ -703,11 +717,11 @@ export class ClaudeSession {
               msgType: msg?.type, stopReason: msg?.type === 'result' ? msg?.stop_reason : msg?.message?.stop_reason,
               hasToolUse: Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use'),
             });
-            if (msg?.type === 'result' && !turnHadToolUse && !reportedSilentTurn && typeof msg?.result === 'string' && msg.result.trim()) {
+            if (msg?.type === 'result' && !turnCommunicated && !reportedSilentTurn && typeof msg?.result === 'string' && msg.result.trim()) {
               this.onSilentTurnEnd?.(msg.result);
               reportedSilentTurn = true;
             }
-            if (msg?.type === 'result') turnHadToolUse = false; // next turn starts fresh
+            if (msg?.type === 'result') turnCommunicated = false; // next turn starts fresh
           }
 
           nextPromise = iterator.next();

@@ -443,6 +443,80 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('DOES call onSilentTurnEnd when the only tool used was not a communication tool', async () => {
+    // Real incident (2026-09-11): a worker used Bash to investigate (query a
+    // database), then gave its actual answer as plain text with no
+    // send_update/ask_user/finish call. "Any tool use counts" wrongly treated
+    // the Bash call as "already communicated" — Bash/Read/Edit never reach
+    // the operator, only the whitelisted communicationToolNames do — so the
+    // real answer was silently dropped exactly like a no-tool-at-all turn.
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: 'echo hi' } }], stop_reason: null },
+      };
+      yield { type: 'user', session_id: 'sess-1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'hi' }] } };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'w-d22cd448 is the agent working on that branch.' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'w-d22cd448 is the agent working on that branch.' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      { communicationToolNames: ['mcp__worker__ask_user', 'mcp__worker__send_update', 'mcp__worker__finish'] },
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(silent).toEqual(['w-d22cd448 is the agent working on that branch.']));
+
+    s.stop();
+  });
+
+  it('does not call onSilentTurnEnd when a whitelisted communication tool was used', async () => {
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'mcp__worker__send_update', input: {} }], stop_reason: null },
+      };
+      yield { type: 'user', session_id: 'sess-1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] } };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Posted the update.' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Posted the update.' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      { communicationToolNames: ['mcp__worker__ask_user', 'mcp__worker__send_update', 'mcp__worker__finish'] },
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 10));
+    expect(silent).toEqual([]);
+
+    s.stop();
+  });
+
   it('does not re-fire onSilentTurnEnd for the same turn after a watchdog reconnect replays it', async () => {
     // A resumed connection can re-surface the prior turn's already-ended result
     // (see the 'session stream drained' comment on resume replay). Without a
@@ -547,7 +621,7 @@ describe('ClaudeSession', () => {
   });
 
   it('does not call onSilentTurnEnd when a tool was used earlier in the turn, even after a mid-turn reconnect', async () => {
-    // turnHadToolUse now also survives reconnects (same session-lifetime scope as
+    // turnCommunicated now also survives reconnects (same session-lifetime scope as
     // turnEnded). A turn that uses a tool, then hangs and reconnects mid-turn
     // (genuinely — turnEnded stays false, the short threshold applies), then ends
     // via a result with no further tool use on the fresh connection, must still be

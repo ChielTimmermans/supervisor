@@ -42,6 +42,13 @@ export class Supervisor {
         watchdogIdleMs: deps.cfg.watchdogIdleMs,
         watchdogWaitingIdleMs: deps.cfg.watchdogWaitingIdleMs,
         maxConsecutiveSilentReconnects: deps.cfg.maxConsecutiveSilentReconnects,
+        // post_to_channel obviously reaches the operator; spawn_worker does
+        // too (bridge.ts posts its own "Started a worker..." confirmation
+        // directly, independent of the model's text). list_repos/
+        // list_workers/stop_worker don't post anything themselves — a turn
+        // that calls only one of those and then answers in plain text is
+        // exactly as invisible as a no-tool-at-all turn.
+        communicationToolNames: ['mcp__supervisor__post_to_channel', 'mcp__supervisor__spawn_worker'],
       },
       (id) => { log.debug('supervisor session id', { session: id }); deps.db.setMeta('supervisor_session', id); },
       (err) => log.error('supervisor session error', { err: err instanceof Error ? err.message : String(err) }),
