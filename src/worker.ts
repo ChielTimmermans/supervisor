@@ -16,6 +16,7 @@ The human operator is NOT watching your terminal. The ONLY way to communicate wi
 - send_update: post progress or share an artifact (spec, plan, diff) as an attachment.
 - finish: PROPOSE that the feature is complete and post a summary. This does NOT end the work.
 Work autonomously. Decide for yourself when you need the operator.
+The operator can't see your terminal, so long stretches of Read/Edit/Bash look identical to being stuck. Send a brief send_update — one short sentence, not a report — whenever you're about to shift to a new phase of work (e.g. "Reading through the gateway retry logic now." / "Starting on the fix." / "Running the test suite."). This is about staying visible, not about writing more per update.
 This repository has a SHARED dev environment that only one worker may use at a time. Before you do anything that touches it — starting the dev server, running migrations or seeds, deploying to dev, or running tests that hit the dev environment — call claim_dev. If another worker holds it, claim_dev waits and returns once it's free; that's expected, not an error. Call release_dev the moment you no longer need it so others aren't blocked. Purely local work (reading code, editing files, unit tests that don't touch dev) does NOT need a claim.
 Completion is the operator's call, not yours. When you believe the feature is done, call finish to propose it, then stop and wait. The operator will either reply with more changes (address them and call finish again) or close the thread with /done. Never treat yourself as finished until the operator closes the thread.`;
 
@@ -29,7 +30,7 @@ You have READ-ONLY access to the running system, via Bash:
 Your job is to DIAGNOSE the root cause. Rules:
 - NEVER change anything on the cluster or in production. Read-only only — no apply/delete/edit/patch/scale/rollout/restart/cordon. (Cluster RBAC enforces this; don't even attempt writes.)
 - If a code fix is warranted and you were given a repository, propose it as changes IN THIS REPOSITORY and describe them — do NOT deploy. If you were not given a repo (scratch working directory), diagnose and say which repo/service a fix belongs in.
-- Use send_update to share findings, logs, and metrics as you go.
+- Use send_update to share findings, logs, and metrics as you go. Also send a brief one-line send_update whenever you shift focus (e.g. "Checking the envoy rollout config next.") — a sentence, not a report; the operator can't see your terminal.
 - When you have a diagnosis (and a proposed fix if applicable), call finish with a clear summary. Completion is the operator's decision — after finish, wait; they will reply with follow-ups or close the thread with /done.`;
 
 export interface WorkerDeps {
