@@ -160,6 +160,16 @@ export class Bridge {
   private spawnWorker(args: { repo: string; task: string; threadRootId: string }): { ok: true; workerId: string } | { ok: false; reason: string } {
     const repo = this.deps.cfg.repos[args.repo];
     if (!repo) { log.warn('spawn rejected: unknown repo', { repo: args.repo }); return { ok: false, reason: `Unknown repo ${args.repo}` }; }
+    // Guards against a real incident: two Mattermost post deliveries for the same operator
+    // message (root cause turned out to be a stale duplicate process, not a race in this
+    // process) each triggered their own spawn_worker call, landing two independent workers
+    // in one thread. Even with that process-level bug fixed, this is a cheap, permanent
+    // safety net against the same symptom recurring for any other reason.
+    const existing = this.deps.db.getWorkerByThread(args.threadRootId);
+    if (existing && (existing.status === 'running' || existing.status === 'waiting')) {
+      log.warn('spawn rejected: worker already active in thread', { thread: args.threadRootId, existing: existing.id });
+      return { ok: false, reason: `A worker (${existing.id}) is already active in this thread` };
+    }
     const active = this.liveCount('feature');
     if (active >= this.deps.cfg.workerConcurrency) { log.warn('spawn rejected: at capacity', { active, cap: this.deps.cfg.workerConcurrency }); return { ok: false, reason: 'Concurrency limit reached' }; }
 
