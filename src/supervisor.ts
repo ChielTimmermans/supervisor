@@ -38,7 +38,17 @@ export class Supervisor {
         mcpServers: { supervisor: deps.toolServer.server },
         allowedTools: deps.toolServer.toolNames,
         disallowedTools: ['Bash', 'Write', 'Edit'],
-        resume: deps.db.getMeta('supervisor_session') ?? undefined,
+        // Deliberately NOT resuming a persisted session across process restarts (unlike
+        // worker.ts's startResumed, which reconnects a specific in-flight task). The
+        // supervisor is a stateless dispatcher — everything it needs per-turn (active
+        // workers, thread state) comes from live tool calls, not conversation memory —
+        // but it's ONE session shared across every thread, forever, with no other reset
+        // path. Real incident (2026-09-21): a session resumed across dozens of restarts
+        // accumulated so many rounds of auto-compaction that it misread the SDK's own
+        // routine compaction continuation text as a prompt injection and refused a
+        // legitimate operator request, then argued about it. Starting clean on every
+        // restart bounds context growth to one restart cycle (the watchdog already
+        // forces those every few hours) instead of letting it run unbounded.
         wait: deps.wait,
         watchdogIdleMs: deps.cfg.watchdogIdleMs,
         watchdogWaitingIdleMs: deps.cfg.watchdogWaitingIdleMs,
@@ -57,7 +67,7 @@ export class Supervisor {
         // answer the way the excluded cases would be.
         communicationToolNames: ['mcp__supervisor__post_to_channel'],
       },
-      (id) => { log.debug('supervisor session id', { session: id }); deps.db.setMeta('supervisor_session', id); },
+      (id) => log.debug('supervisor session id', { session: id }),
       (err) => log.error('supervisor session error', { err: err instanceof Error ? err.message : String(err) }),
       // Usage/rate limit: the supervisor pauses and auto-resumes — it must never go permanently deaf.
       (resetAt) => {
