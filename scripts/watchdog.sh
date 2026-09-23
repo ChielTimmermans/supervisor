@@ -13,6 +13,10 @@ set -euo pipefail
 
 REPO_DIR="/home/dev/supervisor"
 PIDFILE="$REPO_DIR/data/supervisor.pid"
+# Tracks when this script FIRST observed the pidfile's process as gone — not
+# to be confused with the pidfile's own mtime (see incident below). Removed
+# the moment the process is seen healthy again.
+DEADFILE="$REPO_DIR/data/supervisor.pid.dead-since"
 LOG="$REPO_DIR/data/supervisor.log"
 GRACE_SECONDS=30
 NODE_BIN_DIR="/home/dev/.local/share/mise/installs/node/26.2.0/bin"
@@ -22,15 +26,34 @@ cd "$REPO_DIR"
 if [ -f "$PIDFILE" ]; then
   pid="$(cat "$PIDFILE" 2>/dev/null || echo '')"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    rm -f "$DEADFILE"
     exit 0 # healthy, nothing to do
   fi
   # Process is gone. Don't race a normal reload still completing its boot —
-  # only act once the pidfile has been stale for a while.
-  age=$(( $(date +%s) - $(stat -c %Y "$PIDFILE") ))
+  # only act once it's been observed gone for a while.
+  #
+  # Real incident (2026-09-23): this used to compare the PIDFILE's mtime
+  # against GRACE_SECONDS. That timestamp is from whenever the CURRENT pid
+  # was written — i.e. whenever that process last started, which for a
+  # long-running process is hours/days in the past by the time it dies. The
+  # very first cron tick after death always saw an "age" far past
+  # GRACE_SECONDS and restarted immediately, so the grace period never
+  # actually applied — this script raced an in-flight graceful SIGHUP reload
+  # and spawned a second, duplicate supervisor process (both processing the
+  # same Mattermost channel at once — the exact failure mode behind
+  # 771e168's spawn_worker guard). Track "first seen dead" in its own
+  # sentinel file instead, so age reflects how long it's ACTUALLY been gone.
+  if [ ! -f "$DEADFILE" ]; then
+    date +%s > "$DEADFILE"
+    exit 0
+  fi
+  age=$(( $(date +%s) - $(cat "$DEADFILE" 2>/dev/null || echo 0) ))
   if [ "$age" -lt "$GRACE_SECONDS" ]; then
     exit 0
   fi
 fi
+
+rm -f "$DEADFILE"
 
 ts="$(date -u +%H:%M:%S.000)"
 echo "${ts} WARN  external watchdog: supervisor not running (pidfile pid=${pid:-none}) — restarting" >> "$LOG"
