@@ -460,9 +460,18 @@ export class ClaudeSession {
     // turn: a resumed connection (watchdog reconnect, or the long
     // waiting-threshold timeout) can re-surface an already-ended turn's
     // result on the fresh stream — see the 'session stream drained' comment
-    // above on resume replay. Session-lifetime scope (not reset per
-    // connection like turnEnded/turnCommunicated below), only reset by push().
-    let reportedSilentTurn = false;
+    // above on resume replay. Tracks the last-reported result's own `uuid`
+    // (present on every SDKResultMessage) rather than a plain boolean: real
+    // incident (2026-09-22, w-3e55587a) — a worker blocked waiting on the
+    // operator used its own ScheduleWakeup/autonomous-loop tool to check in
+    // on itself periodically, outside of push(), and produced several
+    // genuinely NEW silent plain-text turns over 3+ hours. A sticky boolean
+    // (only reset by push()) treated all of them as "already reported" after
+    // the first one, so nothing after the first ever reached the operator —
+    // not a replay of the same turn, a real gap. Comparing the result
+    // message's own uuid tells "same turn replayed" apart from "new turn,
+    // also silent" correctly regardless of what triggered it.
+    let reportedSilentTurnUuid: string | undefined;
     // True once the most recent assistant message ended the turn (a
     // stop_reason with no outstanding tool_use) with nothing pushed since —
     // i.e. the worker is waiting on the operator, not doing anything.
@@ -539,7 +548,7 @@ export class ClaudeSession {
             // doesn't wait out the rest of a long window.
             turnEnded = false;
             turnCommunicated = false;
-            reportedSilentTurn = false;
+            reportedSilentTurnUuid = undefined;
             consecutiveWaitingReconnects = 0;
             continue;
           }
@@ -717,9 +726,24 @@ export class ClaudeSession {
               msgType: msg?.type, stopReason: msg?.type === 'result' ? msg?.stop_reason : msg?.message?.stop_reason,
               hasToolUse: Array.isArray(msg?.message?.content) && msg.message.content.some((b: any) => b?.type === 'tool_use'),
             });
-            if (msg?.type === 'result' && !turnCommunicated && !reportedSilentTurn && typeof msg?.result === 'string' && msg.result.trim()) {
-              this.onSilentTurnEnd?.(msg.result);
-              reportedSilentTurn = true;
+            if (msg?.type === 'result' && !turnCommunicated && msg?.uuid !== reportedSilentTurnUuid) {
+              // Success results carry the model's final text in `result`. Error-subtype
+              // results (error_during_execution/error_max_turns/error_max_budget_usd/
+              // error_max_structured_output_retries — see SDKResultError) carry NO
+              // `result` field at all, only `errors`. The `typeof === 'string'` guard
+              // below used to make that case fall through with nothing posted anywhere —
+              // not a state-tracking gap like a missed ask_user, genuinely nothing sent,
+              // because there was no text to send. Synthesize one so an errored turn is
+              // reported exactly like a silently-ended one instead of vanishing.
+              const text = typeof msg?.result === 'string' && msg.result.trim()
+                ? msg.result
+                : msg?.subtype && msg.subtype !== 'success'
+                  ? `Turn ended in error (${msg.subtype})${Array.isArray(msg?.errors) && msg.errors.length ? ': ' + msg.errors.join('; ') : ''} — nothing was posted.`
+                  : undefined;
+              if (text) {
+                this.onSilentTurnEnd?.(text);
+                reportedSilentTurnUuid = msg?.uuid;
+              }
             }
             if (msg?.type === 'result') turnCommunicated = false; // next turn starts fresh
           }

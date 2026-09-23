@@ -389,7 +389,7 @@ describe('ClaudeSession', () => {
         session_id: 'sess-1',
         message: { role: 'assistant', content: [{ type: 'text', text: 'Looks done to me.' }], stop_reason: null },
       };
-      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Looks done to me.' };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Looks done to me.', uuid: 'r-looks-done' };
       await new Promise<void>(() => {});
       yield undefined as never;
     })());
@@ -463,7 +463,7 @@ describe('ClaudeSession', () => {
         session_id: 'sess-1',
         message: { role: 'assistant', content: [{ type: 'text', text: 'w-d22cd448 is the agent working on that branch.' }], stop_reason: null },
       };
-      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'w-d22cd448 is the agent working on that branch.' };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'w-d22cd448 is the agent working on that branch.', uuid: 'r-branch-agent' };
       await new Promise<void>(() => {});
       yield undefined as never;
     })());
@@ -517,6 +517,87 @@ describe('ClaudeSession', () => {
     s.stop();
   });
 
+  it('calls onSilentTurnEnd with a synthesized message when the turn ends in an SDK error subtype', async () => {
+    // SDKResultError (error_during_execution/error_max_turns/error_max_budget_usd/
+    // error_max_structured_output_retries) carries no `result` field at all, only
+    // `errors`. The old `typeof msg.result === 'string'` guard silently dropped these —
+    // not a missed-tool-call case, genuinely nothing posted anywhere, because there was
+    // no text to post. Real-world shape: no tool use, no result string, an error subtype.
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Working on it...' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'error_max_turns', session_id: 'sess-1', stop_reason: null, is_error: true, errors: ['max turns exceeded'], uuid: 'r-error-max-turns' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      { communicationToolNames: ['mcp__worker__ask_user', 'mcp__worker__send_update', 'mcp__worker__finish'] },
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(silent).toEqual(['Turn ended in error (error_max_turns): max turns exceeded — nothing was posted.']));
+
+    s.stop();
+  });
+
+  it('fires onSilentTurnEnd again for a genuinely NEW silent turn, with no push() in between', async () => {
+    // Real incident (2026-09-22, w-3e55587a): a worker blocked waiting on the operator
+    // used its own ScheduleWakeup/autonomous-loop tool to check in on itself — outside
+    // of push() — and produced several genuinely new silent plain-text turns over 3+
+    // hours. A single sticky "already reported" boolean (only reset by push()) treated
+    // every one of them after the first as an already-reported replay, so nothing
+    // after the very first ever reached the operator. Two distinct silent turns
+    // (distinct result uuids), separated by a tool_use that starts a new turn, with no
+    // push() at all, must BOTH be reported.
+    const queryFn = vi.fn((_args: any) => (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'sess-1' };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Still waiting on your answer.' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Still waiting on your answer.', uuid: 'r-tick-1' };
+      // The worker checks in on itself via a non-communication tool (e.g. ScheduleWakeup) —
+      // this starts a genuinely new turn (turnEnded flips back to false), with no push().
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'ScheduleWakeup', input: {} }], stop_reason: null },
+      };
+      yield { type: 'user', session_id: 'sess-1', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] } };
+      yield {
+        type: 'assistant',
+        session_id: 'sess-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Loop stopped. Still waiting on your call.' }], stop_reason: null },
+      };
+      yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'Loop stopped. Still waiting on your call.', uuid: 'r-tick-2' };
+      await new Promise<void>(() => {});
+      yield undefined as never;
+    })());
+
+    const silent: string[] = [];
+    const s = new ClaudeSession(
+      queryFn as any,
+      { communicationToolNames: ['mcp__worker__ask_user', 'mcp__worker__send_update', 'mcp__worker__finish'] },
+      () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+      (text) => silent.push(text),
+    );
+    s.start('first');
+
+    await vi.waitFor(() => expect(silent).toEqual(['Still waiting on your answer.', 'Loop stopped. Still waiting on your call.']));
+
+    s.stop();
+  });
+
   it('does not re-fire onSilentTurnEnd for the same turn after a watchdog reconnect replays it', async () => {
     // A resumed connection can re-surface the prior turn's already-ended result
     // (see the 'session stream drained' comment on resume replay). Without a
@@ -533,7 +614,7 @@ describe('ClaudeSession', () => {
           session_id: 'sess-1',
           message: { role: 'assistant', content: [{ type: 'text', text: 'still waiting' }], stop_reason: null },
         };
-        yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'still waiting' };
+        yield { type: 'result', subtype: 'success', session_id: 'sess-1', stop_reason: 'end_turn', result: 'still waiting', uuid: 'r-still-waiting' };
         await new Promise<void>(() => {});
         yield undefined as never;
       })();
