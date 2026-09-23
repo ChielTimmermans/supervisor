@@ -201,21 +201,26 @@ export class Bridge {
     log.info('stopped worker', { worker: id });
   }
 
-  /** Operator explicitly closes a feature/investigation (via `/done`): tear down and confirm. */
-  private closeWorker(id: string): void {
-    const rec = this.deps.db.getWorker(id);
-    this.workers.get(id)?.stop();
-    this.workers.delete(id);
-    this.devLocks.releaseAllFor(id);
-    this.deps.db.updateWorker(id, { status: 'finished' });
-    this.pending.cancel(id);
-    if (rec) {
-      const inc = this.deps.db.getIncidentByThread(rec.threadRootId);
-      if (inc && inc.status !== 'closed') this.deps.db.setIncidentStatus(inc.id, 'closed');
-      void this.deps.gateway.post({ text: 'Closed this thread. 🎉', threadRootId: rec.threadRootId });
-      void applyThreadStatus(this.deps.gateway, rec.threadRootId, 'done');
+  /**
+   * Operator explicitly closes a feature/investigation (via `/done`): tear down EVERY
+   * non-terminal worker on this thread — not just the one getWorkerByThread would
+   * resolve to — and confirm once. See Db.getWorkersByThread's doc comment: a stray
+   * duplicate-spawn row left behind on a thread is otherwise permanently unclosable,
+   * since thread-scoped lookups only ever surface the newest row.
+   */
+  private closeWorkers(ids: string[], threadRootId: string): void {
+    for (const id of ids) {
+      this.workers.get(id)?.stop();
+      this.workers.delete(id);
+      this.devLocks.releaseAllFor(id);
+      this.deps.db.updateWorker(id, { status: 'finished' });
+      this.pending.cancel(id);
+      log.info('closed worker (operator /done)', { worker: id });
     }
-    log.info('closed worker (operator /done)', { worker: id });
+    const inc = this.deps.db.getIncidentByThread(threadRootId);
+    if (inc && inc.status !== 'closed') this.deps.db.setIncidentStatus(inc.id, 'closed');
+    void this.deps.gateway.post({ text: 'Closed this thread. 🎉', threadRootId });
+    void applyThreadStatus(this.deps.gateway, threadRootId, 'done');
     void this.drainQueue(); // closing an investigation may free a slot for a queued one
   }
 
@@ -308,8 +313,8 @@ export class Bridge {
     // worker isn't live in memory (failed resume) or the investigation is only queued.
     const cmd = post.message.trim().toLowerCase();
     if (post.rootId !== '' && (cmd === '/done' || cmd === '/close')) {
-      const w = this.deps.db.getWorkerByThread(post.rootId);
-      if (w) { this.closeWorker(w.id); return; }
+      const ws = this.deps.db.getWorkersByThread(post.rootId).filter((w) => w.status !== 'finished' && w.status !== 'failed');
+      if (ws.length) { this.closeWorkers(ws.map((w) => w.id), post.rootId); return; }
       const inc = this.deps.db.getIncidentByThread(post.rootId);
       if (inc && inc.status !== 'closed') { this.closeIncidentThread(inc); return; }
       // No known worker or open incident — a plain operator thread. Still acknowledge the close.

@@ -87,6 +87,20 @@ export class Db {
     return r ? this.row(r) : undefined;
   }
 
+  /**
+   * ALL worker rows for a thread, not just the newest (see getWorkerByThread above).
+   * Real incident (2026-09-19, w-0408abc5/w-635f57ac): a duplicate spawn_worker call
+   * (root-caused and guarded against in bridge.ts's spawnWorker, commit 771e168) left
+   * two worker rows on one thread_root_id. getWorkerByThread only ever resolves the
+   * newest, so /done kept closing the newer one while the older sat in 'waiting'
+   * forever — unreachable by any thread command, resumed on every restart, still
+   * posting into a thread the operator had closed multiple times. /done needs every
+   * row for a thread, not just the one lookup-by-thread happens to surface.
+   */
+  getWorkersByThread(threadRootId: string): WorkerRecord[] {
+    return this.db.prepare(`SELECT * FROM workers WHERE thread_root_id = ? ORDER BY created_at`).all(threadRootId).map((r) => this.row(r));
+  }
+
   listWorkers(): WorkerRecord[] {
     return this.db.prepare(`SELECT * FROM workers ORDER BY created_at`).all().map((r) => this.row(r));
   }

@@ -138,6 +138,37 @@ describe('Bridge', () => {
     await vi.waitFor(() => expect(streamEnded).toContain('ended'));
   });
 
+  it('operator /done closes EVERY non-terminal worker on a thread, not just the newest', async () => {
+    // Real incident (2026-09-19, w-0408abc5/w-635f57ac): a duplicate spawn_worker call
+    // (the double-delivery bug 771e168's guard now blocks going forward) left two
+    // worker rows on one thread_root_id. getWorkerByThread only ever resolves the
+    // newest, so /done kept closing the newer one while the older sat in 'waiting'
+    // forever — unreachable by any thread command, resumed on every restart, still
+    // posting into a thread the operator had told it to stop touching multiple times.
+    const posts: any[] = [];
+    const sink = { pushed: [] as string[] };
+    const db = new Db(':memory:');
+    const bridge = new Bridge({ queryFn: makeQueryFn(sink), gateway: fakeGateway(posts), db, cfg });
+    await bridge.start();
+
+    // Two rows on the same thread, the older one still 'waiting' — inserted directly
+    // (bypassing spawnWorker's own duplicate guard) to reproduce a row left behind by
+    // history, not a new duplicate spawn.
+    const older = db.createWorker({ id: 'w-older', threadRootId: 'root-dup', repoName: 'acme', repoPath: '/x', task: 'first', kind: 'feature' });
+    db.updateWorker(older.id, { status: 'waiting' });
+    await new Promise((r) => setTimeout(r, 5)); // distinct created_at — createWorker uses Date.now(), and these otherwise tie
+    const newer = db.createWorker({ id: 'w-newer', threadRootId: 'root-dup', repoName: 'acme', repoPath: '/x', task: 'second', kind: 'feature' });
+    db.updateWorker(newer.id, { status: 'finished' }); // already closed once, same as w-635f57ac was
+
+    expect(db.getWorkerByThread('root-dup')!.id).toBe('w-newer'); // confirms the lookup-by-thread ambiguity this test guards against
+
+    await bridge.handlePost(post({ id: 'd-dup', rootId: 'root-dup', message: '/done' }));
+
+    expect(db.getWorker('w-older')!.status).toBe('finished');
+    expect(db.getWorker('w-newer')!.status).toBe('finished');
+    expect(posts.filter((p) => p.threadRootId === 'root-dup' && /closed/i.test(p.text)).length).toBe(1); // one confirmation, not one per row
+  });
+
   it('shutdown() stops every live worker, the supervisor session, and closes the gateway', async () => {
     let n = 0;
     const streamEnded: string[] = [];
