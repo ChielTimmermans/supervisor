@@ -30,4 +30,15 @@ describe('createGcMailNotifier', () => {
     const notify = createGcMailNotifier('/no/such/gc');
     await expect(notify('sess-b', 'dev-env', 'hi')).resolves.toBeUndefined();
   });
+
+  it('resolves (does not hang) when the gc process hangs past the timeout', async () => {
+    const hangStub = join(dir, 'gc-hang');
+    writeFileSync(hangStub, `#!/bin/sh\nsleep 5\n`);
+    chmodSync(hangStub, 0o755);
+
+    const notify = createGcMailNotifier(hangStub, 50);
+    const start = Date.now();
+    await expect(notify('sess-b', 'dev-env', 'hi')).resolves.toBeUndefined();
+    expect(Date.now() - start).toBeLessThan(2000);
+  });
 });

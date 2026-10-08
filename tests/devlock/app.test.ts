@@ -98,4 +98,35 @@ describe('devlock app', () => {
     await a.client.close();
     await b.client.close();
   });
+
+  it('notifies the prior holder when a queued waiter\'s stale timer breaks and promotes it', async () => {
+    const notified: Array<{ sessionId: string; body: string }> = [];
+    const { locks, advance } = harness(200);
+    ({ server } = await startServer(locks, async (sessionId, _subject, body) => { notified.push({ sessionId, body }); }));
+    const url = `http://127.0.0.1:${(server.address() as any).port}/mcp`;
+
+    const a = clientFor(url, { 'X-Repo': 'chipmakers', 'X-Session-Id': 'sess-a' });
+    await a.client.connect(a.transport);
+    await a.client.callTool({ name: 'claim_dev', arguments: {} });
+
+    const b = clientFor(url, { 'X-Repo': 'chipmakers', 'X-Session-Id': 'sess-b' });
+    await b.client.connect(b.transport);
+    // Kick off B's claim while A's hold is still fresh, so B queues behind it (via waitFor)
+    // instead of cold-breaking it — this is the `wr.brokeStale` path, not `res.prior`.
+    const claimB = b.client.callTool({ name: 'claim_dev', arguments: {} });
+
+    await new Promise((r) => setTimeout(r, 100)); // let B's request reach the queued/waiting state
+    advance(1000); // push the mocked clock well past the 200ms TTL before B's stale timer fires
+
+    const grantB = await claimB;
+    // "now yours" (not "a stale hold was broken to grant it") proves B was promoted from the
+    // queue via the stale timer (`wr.brokeStale`), not a cold break on a fresh claim (`res.prior`).
+    expect((grantB.content as any)[0].text).toMatch(/now yours/i);
+    expect(notified).toEqual([
+      { sessionId: 'sess-a', body: `Your hold on the chipmakers dev environment was released after being held past the limit.` },
+    ]);
+
+    await a.client.close();
+    await b.client.close();
+  });
 });
