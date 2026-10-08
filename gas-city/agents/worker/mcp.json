@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "devlock": {
+      "type": "http",
+      "url": "http://127.0.0.1:4810/mcp",
+      "headers": {
+        "X-Repo": "${GC_RIG}",
+        "X-Session-Id": "${GC_SESSION_ID}"
+      }
+    }
+  }
+}

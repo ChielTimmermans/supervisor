@@ -1,4 +1,4 @@
 dir = "chipmakers"
-provider = "claude"
+provider = "claude-worker"
 min_active_sessions = 0
 max_active_sessions = 3
