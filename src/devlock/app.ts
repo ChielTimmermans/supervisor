@@ -2,6 +2,7 @@ import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { DevEnvLocks } from '../devEnvLocks.js';
+import type { Notify } from './notify.js';
 
 function identityFromHeaders(req: express.Request): { repo: string; sessionId: string } | undefined {
   const repo = req.header('x-repo');
@@ -10,7 +11,11 @@ function identityFromHeaders(req: express.Request): { repo: string; sessionId: s
   return { repo, sessionId };
 }
 
-function buildServer(locks: DevEnvLocks, identity: { repo: string; sessionId: string } | undefined): McpServer {
+function buildServer(
+  locks: DevEnvLocks,
+  identity: { repo: string; sessionId: string } | undefined,
+  notify: Notify,
+): McpServer {
   const server = new McpServer({ name: 'devlock', version: '1.0.0' });
 
   server.registerTool(
@@ -26,11 +31,30 @@ function buildServer(locks: DevEnvLocks, identity: { repo: string; sessionId: st
       }
       const { repo, sessionId } = identity;
       const res = locks.claim(repo, sessionId, sessionId);
-      if (res.status === 'granted' || res.status === 'granted-broke-stale') {
+      if (res.status === 'granted') {
         return { content: [{ type: 'text', text: `You now hold the ${repo} dev environment. Call release_dev when done.` }] };
+      }
+      if (res.status === 'granted-broke-stale') {
+        await notify(
+          res.prior.workerId,
+          'dev-env',
+          `Your hold on the ${repo} dev environment was released after being held past the limit. Another session has taken it.`,
+        );
+        return {
+          content: [
+            { type: 'text', text: `You now hold the ${repo} dev environment (a stale hold was broken to grant it). Call release_dev when done.` },
+          ],
+        };
       }
       const wr = await locks.waitFor(res.ticket);
       if (wr.status === 'granted') {
+        if (wr.brokeStale) {
+          await notify(
+            wr.brokeStale.workerId,
+            'dev-env',
+            `Your hold on the ${repo} dev environment was released after being held past the limit.`,
+          );
+        }
         return { content: [{ type: 'text', text: `The ${repo} dev environment is now yours. Call release_dev when done.` }] };
       }
       return { content: [{ type: 'text', text: `The ${repo} dev environment is still busy; you do NOT hold it.` }] };
@@ -59,13 +83,13 @@ function buildServer(locks: DevEnvLocks, identity: { repo: string; sessionId: st
   return server;
 }
 
-export function createDevlockApp(locks: DevEnvLocks): express.Express {
+export function createDevlockApp(locks: DevEnvLocks, notify: Notify): express.Express {
   const app = express();
   app.use(express.json());
 
   app.post('/mcp', async (req, res) => {
     const identity = identityFromHeaders(req);
-    const server = buildServer(locks, identity);
+    const server = buildServer(locks, identity, notify);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
