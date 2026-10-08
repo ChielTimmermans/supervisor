@@ -8,7 +8,7 @@ ready_delay_ms = 0
 
 [providers.claude-worker]
 base = "claude"
-args_append = ["--mcp-config", "/home/dev/supervisor/.claude/worktrees/gas-city-foundation/gas-city/agents/worker/mcp.json"]
+args_append = ["--mcp-config", "/home/dev/supervisor/gas-city/agents/worker/mcp.json"]
 
 # [mail]
 # retention_ttl controls how long read messages are retained before purge.
