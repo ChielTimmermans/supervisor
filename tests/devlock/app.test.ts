@@ -34,9 +34,9 @@ function clientFor(url: string, headers?: Record<string, string>) {
   return { client, transport };
 }
 
-/** Valid headers for a worker session: X-Repo, X-Session-Id, and the required X-Agent. */
+/** Valid headers for a worker session: X-Repo, X-Session-Id, and the matching "<repo>/worker" X-Agent. */
 function workerHeaders(repo: string, sessionId: string): Record<string, string> {
-  return { 'X-Repo': repo, 'X-Session-Id': sessionId, 'X-Agent': 'chipmakers/worker' };
+  return { 'X-Repo': repo, 'X-Session-Id': sessionId, 'X-Agent': `${repo}/worker` };
 }
 
 describe('devlock app', () => {
@@ -92,6 +92,19 @@ describe('devlock app', () => {
     ({ server } = await startServer(locks));
     const url = `http://127.0.0.1:${(server.address() as any).port}/mcp`;
     const { client, transport } = clientFor(url, workerHeaders('chipmakers', 'sess-a'));
+    await client.connect(transport);
+
+    const result = await client.callTool({ name: 'claim_dev', arguments: {} });
+    expect(result.isError).toBeFalsy();
+    expect((result.content as any)[0].text).toMatch(/you now hold/i);
+    await client.close();
+  });
+
+  it('accepts a different rig\'s "<rig>/worker" X-Agent — the allowlist is not hardcoded to chipmakers', async () => {
+    const { locks } = harness();
+    ({ server } = await startServer(locks));
+    const url = `http://127.0.0.1:${(server.address() as any).port}/mcp`;
+    const { client, transport } = clientFor(url, workerHeaders('some-other-rig', 'sess-a'));
     await client.connect(transport);
 
     const result = await client.callTool({ name: 'claim_dev', arguments: {} });
@@ -214,5 +227,43 @@ describe('devlock app', () => {
 
     await a.client.close();
     await b.client.close();
+  });
+
+  it('notifies the broken prior holder even when the newly-promoted waiter has already abandoned its connection', async () => {
+    const notified: Array<{ sessionId: string; body: string }> = [];
+    const { locks, advance } = harness(200);
+    ({ server } = await startServer(locks, async (sessionId, _subject, body) => { notified.push({ sessionId, body }); }));
+    const url = `http://127.0.0.1:${(server.address() as any).port}/mcp`;
+
+    const a = clientFor(url, workerHeaders('chipmakers', 'sess-a'));
+    await a.client.connect(a.transport);
+    await a.client.callTool({ name: 'claim_dev', arguments: {} });
+
+    const b = clientFor(url, workerHeaders('chipmakers', 'sess-b'));
+    await b.client.connect(b.transport);
+    const claimB = b.client.callTool({ name: 'claim_dev', arguments: {} }).catch(() => {});
+
+    await new Promise((r) => setTimeout(r, 100)); // let B queue behind A (via waitFor)
+    await b.transport.close(); // B abandons before its own stale-break promotion ever fires
+    await claimB;
+
+    advance(1000); // past the 200ms TTL — fires B's head-of-queue stale timer, breaking A and promoting B
+    await new Promise((r) => setTimeout(r, 200)); // let the stale timer + notify + abandonment guard run
+
+    // A must be told its hold was broken even though B — the session that got promoted — never
+    // received the response. This is the fix: notify runs before the abandonment check, not after.
+    expect(notified).toEqual([
+      { sessionId: 'sess-a', body: `Your hold on the chipmakers dev environment was released after being held past the limit.` },
+    ]);
+
+    // And the dev env must not be stuck "held" by abandoned B.
+    const c = clientFor(url, workerHeaders('chipmakers', 'sess-c'));
+    await c.client.connect(c.transport);
+    const grantC = await c.client.callTool({ name: 'claim_dev', arguments: {} });
+    expect((grantC.content as any)[0].text).toMatch(/you now hold/i);
+    expect(locks.holderOf('chipmakers')?.workerId).toBe('sess-c');
+
+    await a.client.close();
+    await c.client.close();
   });
 });

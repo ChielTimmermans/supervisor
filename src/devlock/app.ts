@@ -5,7 +5,8 @@ import type { DevEnvLocks } from '../devEnvLocks.js';
 import type { Notify } from './notify.js';
 
 /**
- * The GC_TEMPLATE value Claude Code's CLI sets for a real `chipmakers/worker` session.
+ * Allowlists the X-Agent header to exactly "<rig>/worker" — any rig's real worker agent,
+ * never a generated pool agent.
  *
  * Verified live on 2026-10-08 by `gc sling chipmakers/worker ...` and reading
  * `/proc/<pid>/environ` of the spawned session: GC_TEMPLATE=chipmakers/worker.
@@ -13,9 +14,14 @@ import type { Notify } from './notify.js';
  * — NOT a stable agent identifier — so it can't be used for this allowlist.)
  * The auto-generated pool agent spawned from `[providers.claude-worker]`
  * (`chipmakers/claude-worker`) resolves GC_TEMPLATE to `chipmakers/claude-worker`
- * instead, confirmed the same way, so this exact-match check excludes it.
+ * instead, confirmed the same way — exactly two slash-separated segments with the
+ * second equal to "worker" tells the two apart, for chipmakers or any future rig.
  */
-const REQUIRED_AGENT = 'chipmakers/worker';
+function isWorkerAgent(template: string | undefined): boolean {
+  if (!template) return false;
+  const parts = template.split('/');
+  return parts.length === 2 && parts[1] === 'worker';
+}
 
 type Identity = { repo: string; sessionId: string };
 
@@ -26,8 +32,8 @@ function identityFromHeaders(req: express.Request): Identity | { error: string }
     return { error: 'Missing required X-Repo or X-Session-Id header' };
   }
   const agent = req.header('x-agent');
-  if (agent !== REQUIRED_AGENT) {
-    return { error: `Missing or invalid X-Agent header (expected "${REQUIRED_AGENT}")` };
+  if (!isWorkerAgent(agent)) {
+    return { error: 'Missing or invalid X-Agent header (expected "<rig>/worker")' };
   }
   return { repo, sessionId };
 }
@@ -70,22 +76,26 @@ function buildServer(
       }
       const wr = await locks.waitFor(res_.ticket);
       if (wr.status === 'granted') {
-        // The client may have given up waiting (its own request timeout elapsed) long before
-        // the server's wait resolves here — the MCP SDK client's default timeout (60s) is far
-        // shorter than DEV_CLAIM_WAIT_TIMEOUT_MS (15min default). We were just granted the
-        // claim (DevEnvLocks already recorded us as holder), but if nobody is listening for
-        // the response, release immediately rather than leave a phantom holder that will never
-        // call release_dev and will sit for a full TTL before anyone can even attempt to break it.
-        if (res.writableEnded || res.destroyed) {
-          locks.release(repo, sessionId);
-          return { content: [{ type: 'text', text: `The ${repo} dev environment was granted but the connection is gone; released.` }] };
-        }
+        // Notify the dispossessed prior holder (if any) before checking whether our own
+        // connection is still alive below — that holder needs to know its claim was broken
+        // regardless of whether the session we promoted is still around to hear about it.
         if (wr.brokeStale) {
           await notify(
             wr.brokeStale.workerId,
             'dev-env',
             `Your hold on the ${repo} dev environment was released after being held past the limit.`,
           );
+        }
+        // The client may have given up waiting (its own request timeout elapsed) long before
+        // the server's wait resolves here — live testing found this installed Claude Code
+        // version's own MCP request timeout floor is ~300s, still far shorter than
+        // DEV_CLAIM_WAIT_TIMEOUT_MS (15min default). We were just granted the claim
+        // (DevEnvLocks already recorded us as holder), but if nobody is listening for the
+        // response, release immediately rather than leave a phantom holder that will never
+        // call release_dev and will sit for a full TTL before anyone can even attempt to break it.
+        if (res.writableEnded || res.destroyed) {
+          locks.release(repo, sessionId);
+          return { content: [{ type: 'text', text: `The ${repo} dev environment was granted but the connection is gone; released.` }] };
         }
         return { content: [{ type: 'text', text: `The ${repo} dev environment is now yours. Call release_dev when done.` }] };
       }
